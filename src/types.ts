@@ -144,6 +144,7 @@ export interface KnownPrCursor {
 export interface RepoRuntimeState {
   etag?: string;
   etagKey?: string;
+  lastPageCount?: number;
   filterHash?: string;
   baselineCapturedAt?: string;
   lastPollAt?: string;
@@ -151,6 +152,13 @@ export interface RepoRuntimeState {
   lastError?: string;
   knownPrs: Record<string, KnownPrCursor>;
   recentCreations?: number[];
+}
+
+export interface GroupCreateAttempt {
+  path: 'ipc' | 'cli';
+  idempotencyKey: string;
+  startedAt: string;
+  outcomeUnknown: boolean;
 }
 
 export interface PrGroupRecord {
@@ -166,6 +174,8 @@ export interface PrGroupRecord {
   kickoffVerified?: boolean;
   topNoticeSet: boolean;
   shareLinkPosted?: boolean;
+  lifecycleGeneration?: number;
+  createAttempt?: GroupCreateAttempt;
   lastHeadSha: string;
   createdAt: string;
   updatedAt: string;

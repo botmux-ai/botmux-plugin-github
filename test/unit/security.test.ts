@@ -9,10 +9,12 @@ import {
   buildKickoffPrompt,
   computeIsFork,
   formatUntrustedPrMetadataXml,
+  makeCanonicalPrGroupPrefix,
   renderSafeGroupName,
   renderTemplateSafe,
   sanitizeUntrustedText,
 } from '../../src/security/sanitize.ts';
+import { groupNameMatchesPr } from '../../src/host/bridge.ts';
 import { buildNewCommitMessage, buildPrClosedMessage } from '../../src/engine/rules.ts';
 import { isTrustedLarkShareLink } from '../../src/host/lark.ts';
 import {
@@ -154,8 +156,22 @@ describe('Anti-injection sanitization, XML metadata escaping & safe templates', 
     assert.ok(Array.from(groupName).length <= 100);
     assert.ok(groupName.includes('acme/demo-repo#42') || groupName.includes('#42'));
     assert.ok(!groupName.includes('<at'));
-    // Verify no broken UTF-16 surrogate pairs
-    assert.equal(groupName.includes('�'), false);
+    // Regression #11: GitHub max-length 39-char owner + 100-char repo + 9-digit PR# MUST stay <= 100 code points AND remain deduplicable!
+    const maxOwner = 'o'.repeat(39);
+    const maxRepo = 'r'.repeat(100);
+    const maxSlug = `${maxOwner}/${maxRepo}`;
+    const maxPr = makePr({ repo: maxSlug, number: 123456789, title: 'Fix long repo edge case' });
+    const renderedLong = renderSafeGroupName('PR #{{prNumber}} {{repo}} - {{title}}', maxPr);
+    assert.ok(
+      Array.from(renderedLong).length <= 100,
+      `Expected <= 100 code points, got ${Array.from(renderedLong).length}: ${renderedLong}`,
+    );
+    assert.ok(renderedLong.startsWith(makeCanonicalPrGroupPrefix(maxSlug, 123456789)));
+    assert.equal(groupNameMatchesPr(renderedLong, renderedLong, maxSlug, 123456789), true);
+    assert.equal(groupNameMatchesPr(renderedLong, 'other', maxSlug, 123456789), true);
+    assert.equal(groupNameMatchesPr('[acme/demo-repo#42]Fix v2', '[acme/demo-repo#42]Fix', 'acme/demo-repo', 42), true);
+    assert.equal(groupNameMatchesPr(renderedLong, 'other', maxSlug, 12345678), false);
+    assert.equal(groupNameMatchesPr(renderedLong, 'other', `${maxOwner}/${'x'.repeat(100)}`, 123456789), false);
   });
 
   it('bounds multi-byte UTF-8 kickoff prompt <= 8192 bytes while keeping XML closing tag and PR number intact', () => {
@@ -254,6 +270,19 @@ describe('Hardened 0600/0700 filesystem primitives & symlink/lock safety', () =>
       );
       assert.equal(await fsp.readFile(decoy, 'utf8'), 'original', 'Symlink target must remain untouched');
 
+      // Regression #12: Non-immediate ancestor symlink (alias/one/two/secret.json) MUST be rejected!
+      const redirectedTarget = join(base, 'redirected-dir');
+      await fsp.mkdir(redirectedTarget, { recursive: true, mode: 0o700 });
+      const aliasDir = join(base, 'alias');
+      await fsp.symlink(redirectedTarget, aliasDir);
+      const deepNestedPath = join(aliasDir, 'one', 'two', 'secret.json');
+      await assert.rejects(
+        () => writeSecureFileAtomic(deepNestedPath, '{"secret":1}\n'),
+        (err: unknown) => err instanceof SecurityFsError && err.code === 'SYMLINK_REJECTED',
+      );
+      const redirectedContents = await fsp.readdir(redirectedTarget);
+      assert.deepEqual(redirectedContents, [], 'Write must NEVER traverse non-immediate ancestor symlink');
+
       // Stale dead-PID lock recovery + nonce-verified release
       const lockPath = join(secureDir, 'test.lock');
       await fsp.writeFile(
@@ -275,6 +304,14 @@ describe('Hardened 0600/0700 filesystem primitives & symlink/lock safety', () =>
       const stillExists = await fsp.stat(lockPath).then(() => true, () => false);
       assert.equal(stillExists, true);
       await lock2.release();
+
+      // Empty 0-byte truncated lockfile (e.g. SIGKILL mid-lock-creation) MUST recover via staleMs!
+      const truncatedLock = join(secureDir, 'truncated.lock');
+      await fsp.writeFile(truncatedLock, '', { mode: 0o600 });
+      const oldTime = new Date(Date.now() - 60_000);
+      await fsp.utimes(truncatedLock, oldTime, oldTime);
+      const lock3 = await acquireSecureLock(truncatedLock, { timeoutMs: 1000, staleMs: 1000 });
+      await lock3.release();
     } finally {
       await fsp.rm(base, { recursive: true, force: true });
     }

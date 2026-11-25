@@ -1,6 +1,6 @@
 # @botmux-ai/plugin-github
 
-Official GitHub event monitoring and automated PR review group plugin for [Botmux](https://github.com/botmux-ai/botmux).
+Official GitHub event monitoring and automated PR review group plugin for [Botmux](https://github.com/deepcoldy/botmux).
 
 [English](#english) | [中文说明](#中文说明)
 
@@ -152,7 +152,7 @@ npm test
 
 ### 简介
 
-`@botmux-ai/plugin-github` 是 [Botmux](https://github.com/botmux-ai/botmux) 官方 GitHub 事件监控与新 PR 自动拉群 Review 插件。
+`@botmux-ai/plugin-github` 是 [Botmux](https://github.com/deepcoldy/botmux) 官方 GitHub 事件监控与新 PR 自动拉群 Review 插件。
 
 核心特性：
 

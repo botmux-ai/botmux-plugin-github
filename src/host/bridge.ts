@@ -1,5 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { join } from 'node:path';
 import type {
   LarkBrand,
   PrGroupRecord,
@@ -8,9 +9,14 @@ import type {
   RepoRule,
 } from '../types.ts';
 import { MAX_IPC_TEXT_BYTES } from '../types.ts';
+import { acquireSecureLock } from '../security/fs.ts';
 import { loopbackRequest } from '../security/net.ts';
 import { SecretRegistry, defaultSecretRegistry, formatSafeError } from '../security/redact.ts';
-import { buildKickoffPrompt, renderSafeGroupName } from '../security/sanitize.ts';
+import {
+  buildKickoffPrompt,
+  makeCanonicalPrGroupPrefix,
+  renderSafeGroupName,
+} from '../security/sanitize.ts';
 import type { StateStore } from '../state/store.ts';
 import { makePrKey } from '../state/store.ts';
 import type { GitHubClient } from '../github/client.ts';
@@ -120,11 +126,41 @@ function escapeRegExp(s: string): string {
 }
 
 /**
+ * Returns true iff a PR group record has completed every required orchestration
+ * step for `rule` (chat created, kickoff verified when present, top notice pinned
+ * when required, share-link PR comment posted when required).
+ */
+export function isPrGroupComplete(
+  record: PrGroupRecord | undefined,
+  rule: RepoRule,
+): boolean {
+  if (!record || record.status !== 'active' || !record.chatId) {
+    return false;
+  }
+  if (record.createAttempt?.outcomeUnknown) {
+    return false;
+  }
+  if ((rule.kickoffBotAppId || rule.setTopNotice) && !record.kickoffMessageId) {
+    return false;
+  }
+  if (record.kickoffMessageId && record.kickoffVerified !== true) {
+    return false;
+  }
+  if (rule.setTopNotice && !record.topNoticeSet) {
+    return false;
+  }
+  if (rule.postShareLinkToPr && record.shareLink && !record.shareLinkPosted) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Checks whether an existing Feishu group name matches the exact expected group
- * name or starts with the trusted canonical prefix `[owner/repo#N]` or
- * `PR #N owner/repo`. Strictly anchored to the start so untrusted PR titles
- * mentioning other PR numbers (e.g. "see owner/repo#51") can NEVER hijack
- * deduplication for future PRs!
+ * name or starts with the trusted canonical prefix `[owner/repo#N]`,
+ * `PR #N owner/repo`, or the bounded hashed canonical prefix for long owner/repo
+ * names. Strictly anchored to the start so untrusted PR titles mentioning other
+ * PR numbers (e.g. "see owner/repo#51") can NEVER hijack deduplication!
  */
 export function groupNameMatchesPr(
   existingName: string | undefined,
@@ -138,8 +174,13 @@ export function groupNameMatchesPr(
   if (normExisting === normExpected) return true;
 
   const repoEsc = escapeRegExp(repo);
-  // Strictly anchored to trusted prefix: "[owner/repo#N]" or "PR #N owner/repo"
-  const bracketPrefixRe = new RegExp(`^\\[${repoEsc}#${prNumber}\\](?=$|[\\s\\-:])`, 'i');
+  // Closing ']' is already an unambiguous delimiter, so no extra trailing whitespace lookahead needed.
+  const canonicalPrefix = makeCanonicalPrGroupPrefix(repo, prNumber);
+  const canonicalPrefixEsc = escapeRegExp(canonicalPrefix);
+  const canonicalRe = new RegExp(`^${canonicalPrefixEsc}`, 'i');
+  if (canonicalRe.test(normExisting)) return true;
+
+  const bracketPrefixRe = new RegExp(`^\\[${repoEsc}#${prNumber}\\]`, 'i');
   if (bracketPrefixRe.test(normExisting)) return true;
 
   const prPrefixRe = new RegExp(`^PR\\s*#${prNumber}\\s+${repoEsc}(?=$|[\\s\\-:])`, 'i');
@@ -716,13 +757,38 @@ export class HostBridge {
   }
 
   /**
-   * Executes the full crash-safe PR review group orchestration flow:
-   * - Resumes cleanly from any persisted step without ever creating a duplicate group
+   * Executes the full crash-safe PR review group orchestration flow under a
+   * cross-process exclusive per-PR lock:
+   * - Mutually exclusive across separate HostBridge / CLI / service processes
    * - Queries creator daemon GET /api/groups before creating even if state was wiped
+   * - Tracks createAttempt.outcomeUnknown so a dropped IPC response NEVER blindly
+   *   switches to CLI fallback (must first verify via GET /api/groups!)
    * - Persists chatId immediately upon creation (including partial 502 responses)
-   * - Handles dual-core kickoff + readback verification + dual-path top-notice + idempotent PR comment
+   * - Refuses to pin top-notice or mark active until kickoff readback & required
+   *   steps succeed; partial failures remain resumable without creating a 2nd group
    */
   async ensurePrReviewGroup(opts: {
+    rule: RepoRule;
+    pr: PullRequestInfo;
+    githubClient: GitHubClient;
+  }): Promise<GroupOrchestrationResult> {
+    const prKey = makePrKey(opts.rule.repo, opts.pr.number);
+    const lockHash = createHash('sha256').update(prKey).digest('hex').slice(0, 24);
+    const prLockPath = join(this.stateStore.pluginHome, 'locks', `pr-${lockHash}.lock`);
+    const prLock = await acquireSecureLock(prLockPath, {
+      timeoutMs: 45_000,
+      staleMs: 90_000,
+      pollMs: 30,
+    });
+
+    try {
+      return await this.ensurePrReviewGroupLocked(opts);
+    } finally {
+      await prLock.release();
+    }
+  }
+
+  private async ensurePrReviewGroupLocked(opts: {
     rule: RepoRule;
     pr: PullRequestInfo;
     githubClient: GitHubClient;
@@ -753,9 +819,14 @@ export class HostBridge {
     let record = await this.stateStore.update(state => {
       const existing = state.prGroups[prKey];
       if (existing) {
-        // Keep existing chatId / kickoff / topNotice flags across crash resume!
         existing.updatedAt = nowIso;
         existing.lastHeadSha = pr.headSha;
+        if (existing.status === 'closed') {
+          existing.lifecycleGeneration = (existing.lifecycleGeneration ?? 1) + 1;
+          existing.status = 'creating';
+        } else if (!isPrGroupComplete(existing, rule)) {
+          existing.status = 'creating';
+        }
         return { ...existing };
       }
       const created: PrGroupRecord = {
@@ -766,6 +837,7 @@ export class HostBridge {
         creatorLarkAppId: rule.creatorBotAppId,
         ...(rule.kickoffBotAppId ? { kickoffBotAppId: rule.kickoffBotAppId } : {}),
         topNoticeSet: false,
+        lifecycleGeneration: 1,
         lastHeadSha: pr.headSha,
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -783,6 +855,7 @@ export class HostBridge {
 
     // Step 2: If no chatId recorded yet, check creator daemon GET /api/groups to prevent duplicate groups!
     // Exclude any chatId already bound to a DIFFERENT PR in state.prGroups.
+    let verifiedEmptyViaDaemonGroups = false;
     if (!record.chatId && canUseDaemonIpc) {
       const currentState = await this.stateStore.load();
       const chatIdsBoundToOtherPrs = new Set<string>();
@@ -804,6 +877,7 @@ export class HostBridge {
             const cur = state.prGroups[prKey]!;
             cur.chatId = matched.chatId;
             cur.groupName = matched.name || groupName;
+            delete cur.createAttempt;
             cur.updatedAt = new Date(this.now()).toISOString();
             return { ...cur };
           });
@@ -815,8 +889,33 @@ export class HostBridge {
             chatId: matched.chatId,
             message: `Adopted existing group ${matched.chatId} from GET /api/groups for ${prKey}`,
           });
+        } else {
+          verifiedEmptyViaDaemonGroups = true;
         }
       }
+    }
+
+    // Fail closed if a prior create attempt had an unknown outcome (e.g. socket reset/timeout)
+    // and we could NOT verify via creator daemon GET /api/groups whether that group was created!
+    if (!record.chatId && record.createAttempt?.outcomeUnknown) {
+      if (!verifiedEmptyViaDaemonGroups) {
+        const errMsg = `Prior ${record.createAttempt.path} group creation attempt for ${prKey} has unknown outcome and creator daemon GET /api/groups is currently unavailable; refusing to switch execution path or retry create to prevent duplicate groups.`;
+        await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey];
+          if (cur) {
+            cur.lastError = errMsg;
+            cur.updatedAt = new Date(this.now()).toISOString();
+          }
+        });
+        throw new Error(errMsg);
+      }
+      // GET /api/groups confirmed no group exists -> safe to clear unknown outcome flag
+      record = await this.stateStore.update(state => {
+        const cur = state.prGroups[prKey]!;
+        delete cur.createAttempt;
+        cur.updatedAt = new Date(this.now()).toISOString();
+        return { ...cur };
+      });
     }
 
     // Step 3: Create group ONLY if chatId is still unknown
@@ -829,8 +928,22 @@ export class HostBridge {
         larkAppIds.push(rule.kickoffBotAppId);
       }
 
+      const attemptId = randomBytes(8).toString('hex');
+
       if (canUseDaemonIpc && creatorDaemon && dashboardSecret) {
-        // Resolve human invitees & owner transfer from creator daemon's resolvedAllowedUsers
+        // Persist unknown-outcome create attempt BEFORE transmitting POST /api/groups/create!
+        record = await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.createAttempt = {
+            path: 'ipc',
+            idempotencyKey: attemptId,
+            startedAt: new Date(this.now()).toISOString(),
+            outcomeUnknown: true,
+          };
+          cur.updatedAt = new Date(this.now()).toISOString();
+          return { ...cur };
+        });
+
         const userOpenIds = creatorDaemon.resolvedAllowedUsers.filter(u => u.startsWith('ou_'));
         const ownerUnionIds = creatorDaemon.resolvedAllowedUsers.filter(u => u.startsWith('on_'));
 
@@ -847,7 +960,6 @@ export class HostBridge {
               ? { transferOwnerUnionId: ownerUnionIds[0] }
               : {}),
           ...(larkAppIds.length >= 2 ? { botCollaboration: true } : {}),
-          // Upcoming core PR fields (silently ignored on current core; handled natively on new core)
           ...(rule.kickoffBotAppId
             ? {
                 kickoffBotLarkAppId: rule.kickoffBotAppId,
@@ -857,14 +969,40 @@ export class HostBridge {
           ownerNotice: false,
         };
 
-        const resp = await this.daemonRequest({
-          ipcPort: creatorDaemon.ipcPort,
-          secret: dashboardSecret,
-          method: 'POST',
-          path: '/api/groups/create',
-          body: createBody,
-          timeoutMs: 35_000,
-        });
+        let resp: { status: number; json: unknown; rawText: string };
+        try {
+          resp = await this.daemonRequest({
+            ipcPort: creatorDaemon.ipcPort,
+            secret: dashboardSecret,
+            method: 'POST',
+            path: '/api/groups/create',
+            body: createBody,
+            timeoutMs: 35_000,
+          });
+        } catch (err: unknown) {
+          const code = (err as NodeJS.ErrnoException)?.code;
+          if (code === 'ECONNREFUSED') {
+            // Connection never reached daemon -> definitely not created; clear unknown outcome
+            await this.stateStore.update(state => {
+              const cur = state.prGroups[prKey];
+              if (cur) {
+                delete cur.createAttempt;
+                cur.lastError = formatSafeError(err, this.registry);
+                cur.updatedAt = new Date(this.now()).toISOString();
+              }
+            });
+          } else {
+            // Socket reset / timeout / aborted -> keep outcomeUnknown: true!
+            await this.stateStore.update(state => {
+              const cur = state.prGroups[prKey];
+              if (cur) {
+                cur.lastError = `IPC create outcome unknown: ${formatSafeError(err, this.registry)}`;
+                cur.updatedAt = new Date(this.now()).toISOString();
+              }
+            });
+          }
+          throw err;
+        }
 
         const body = (resp.json && typeof resp.json === 'object'
           ? resp.json
@@ -875,6 +1013,7 @@ export class HostBridge {
           record = await this.stateStore.update(state => {
             const cur = state.prGroups[prKey]!;
             cur.chatId = body.chatId;
+            delete cur.createAttempt;
             if (typeof body.shareLink === 'string' && body.shareLink) {
               cur.shareLink = body.shareLink;
             }
@@ -906,12 +1045,35 @@ export class HostBridge {
             );
           }
         } else {
+          // Definite pre-create rejection (400/401/403/503 without chatId): safe to clear outcomeUnknown
+          const definitePreCreate =
+            resp.status === 400 || resp.status === 401 || resp.status === 403 || resp.status === 503;
+          await this.stateStore.update(state => {
+            const cur = state.prGroups[prKey];
+            if (cur) {
+              if (definitePreCreate) delete cur.createAttempt;
+              cur.lastError = `POST /api/groups/create failed (${resp.status})`;
+              cur.updatedAt = new Date(this.now()).toISOString();
+            }
+          });
           throw new Error(
             `POST /api/groups/create failed (${resp.status}): ${this.registry.redactString(body.error ?? resp.rawText.slice(0, 200))}`,
           );
         }
       } else {
-        // Fallback when creator daemon IPC is unavailable: botmux create-group CLI
+        // Fallback when creator daemon IPC is unavailable (and NO prior unknown IPC attempt exists): botmux create-group CLI
+        record = await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.createAttempt = {
+            path: 'cli',
+            idempotencyKey: attemptId,
+            startedAt: new Date(this.now()).toISOString(),
+            outcomeUnknown: true,
+          };
+          cur.updatedAt = new Date(this.now()).toISOString();
+          return { ...cur };
+        });
+
         const cliRes = await this.createGroupViaCliFallback({
           rule,
           groupName,
@@ -920,6 +1082,7 @@ export class HostBridge {
         record = await this.stateStore.update(state => {
           const cur = state.prGroups[prKey]!;
           cur.chatId = cliRes.chatId;
+          delete cur.createAttempt;
           if (cliRes.kickoffMessageId) {
             cur.kickoffMessageId = cliRes.kickoffMessageId;
           }
@@ -944,7 +1107,6 @@ export class HostBridge {
 
     // Step 4: Current-core kickoff fallback (when POST /api/groups/create returned kickoffMessageId == null)
     if (!record.kickoffMessageId && canUseDaemonIpc && creatorDaemon && dashboardSecret) {
-      // Crash-recovery check: see if kickoff was already posted before a prior crash!
       const alreadySentMsgId = await this.findExistingKickoffMessage(
         chatId,
         rule.repo,
@@ -995,62 +1157,85 @@ export class HostBridge {
         record = await this.stateStore.update(state => {
           const cur = state.prGroups[prKey]!;
           cur.kickoffMessageId = sent.messageId;
+          cur.kickoffVerified = false;
           cur.updatedAt = new Date(this.now()).toISOString();
           return { ...cur };
         });
       }
     }
 
-    // Step 5: Readback verification of kickoffMessageId confirming it matches current PR number
-    if (record.kickoffMessageId && !record.kickoffVerified && canUseDaemonIpc && creatorDaemon && dashboardSecret) {
-      const check = await this.verifyKickoffMessageReadback(
-        chatId,
-        record.kickoffMessageId,
-        rule.repo,
-        pr.number,
-        creatorDaemon.ipcPort,
-        dashboardSecret,
-      );
-      if (check.verified) {
-        record = await this.stateStore.update(state => {
-          const cur = state.prGroups[prKey]!;
-          cur.kickoffVerified = true;
-          cur.updatedAt = new Date(this.now()).toISOString();
-          return { ...cur };
-        });
-      } else {
-        const reason = check.reason ?? 'unverified';
-        await this.stateStore.appendEvent({
-          level: 'warn',
-          kind: 'kickoff_readback_mismatch',
-          repo: rule.repo,
-          prNumber: pr.number,
-          chatId,
-          message: `Kickoff message ${record.kickoffMessageId} readback check failed: ${reason}`,
-        });
+    // Step 5: Mandatory readback verification of kickoffMessageId before pinning top-notice or marking active!
+    if (record.kickoffMessageId && !record.kickoffVerified) {
+      if (canUseDaemonIpc && creatorDaemon && dashboardSecret) {
+        let check: { verified: boolean; reason?: string };
+        try {
+          check = await this.verifyKickoffMessageReadback(
+            chatId,
+            record.kickoffMessageId,
+            rule.repo,
+            pr.number,
+            creatorDaemon.ipcPort,
+            dashboardSecret,
+          );
+        } catch (err) {
+          check = { verified: false, reason: `kickoff_readback_error:${formatSafeError(err, this.registry)}` };
+        }
 
-        // Definite mismatch or deleted kickoff message: NEVER pin it as top notice or mark active!
-        if (
-          reason === 'kickoff_message_pr_mismatch' ||
-          reason === 'kickoff_message_deleted' ||
-          reason === 'kickoff_message_chat_mismatch'
-        ) {
+        if (check.verified) {
+          record = await this.stateStore.update(state => {
+            const cur = state.prGroups[prKey]!;
+            cur.kickoffVerified = true;
+            cur.updatedAt = new Date(this.now()).toISOString();
+            return { ...cur };
+          });
+        } else {
+          const reason = check.reason ?? 'unverified';
+          await this.stateStore.appendEvent({
+            level: 'warn',
+            kind: 'kickoff_readback_failed',
+            repo: rule.repo,
+            prNumber: pr.number,
+            chatId,
+            message: `Kickoff message ${record.kickoffMessageId} readback failed: ${reason}`,
+          });
+
+          const isDefiniteMismatch =
+            reason === 'kickoff_message_pr_mismatch' ||
+            reason === 'kickoff_message_deleted' ||
+            reason === 'kickoff_message_chat_mismatch';
+
           await this.stateStore.update(state => {
             const cur = state.prGroups[prKey]!;
-            cur.kickoffMessageId = null;
+            if (isDefiniteMismatch) {
+              cur.kickoffMessageId = null;
+            }
             cur.kickoffVerified = false;
+            cur.status = 'creating';
             cur.lastError = reason;
             cur.updatedAt = new Date(this.now()).toISOString();
           });
+
+          // Never pin top-notice or transition to active while kickoff is unverified!
           throw new Error(
-            `Kickoff message readback rejected for ${prKey} in ${chatId}: ${reason}`,
+            `Kickoff message readback not verified for ${prKey} in ${chatId}: ${reason}`,
           );
         }
-        warnings.push(`Kickoff readback verification warning: ${reason}`);
+      } else {
+        // Cannot verify kickoff readback while creator daemon IPC is offline -> keep status='creating' and fail closed!
+        await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.status = 'creating';
+          cur.kickoffVerified = false;
+          cur.lastError = 'kickoff_readback_daemon_offline';
+          cur.updatedAt = new Date(this.now()).toISOString();
+        });
+        throw new Error(
+          `Cannot verify kickoff message ${record.kickoffMessageId} while creator daemon is offline`,
+        );
       }
     }
 
-    // Step 6: Top-notice pinning (new core IPC -> direct Feishu/Lark Open Platform fallback)
+    // Step 6: Top-notice pinning (only after kickoff is verified; failure keeps status='creating' so retry resumes!)
     if (rule.setTopNotice && record.kickoffMessageId && !record.topNoticeSet) {
       const noticeRes = await this.setTopNoticeDualPath({
         creatorLarkAppId: rule.creatorBotAppId,
@@ -1075,19 +1260,27 @@ export class HostBridge {
           message: `Pinned top notice ${record.kickoffMessageId} via ${noticeRes.pathUsed}`,
         });
       } else {
-        warnings.push(`Top notice warning: ${noticeRes.error ?? 'failed'}`);
+        const errMsg = noticeRes.error ?? 'top_notice_failed';
         await this.stateStore.appendEvent({
           level: 'warn',
           kind: 'top_notice_failed',
           repo: rule.repo,
           prNumber: pr.number,
           chatId,
-          message: `Failed to pin top notice: ${noticeRes.error ?? 'unknown'}`,
+          message: `Failed to pin top notice: ${errMsg}`,
         });
+        await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.status = 'creating';
+          cur.topNoticeSet = false;
+          cur.lastError = errMsg;
+          cur.updatedAt = new Date(this.now()).toISOString();
+        });
+        throw new Error(`Top notice pinning failed for ${prKey} in ${chatId}: ${errMsg}`);
       }
     }
 
-    // Step 7: Optional idempotent PR share-link comment
+    // Step 7: Optional idempotent PR share-link comment (failure keeps status='creating' so retry completes it!)
     if (rule.postShareLinkToPr && record.shareLink && !record.shareLinkPosted) {
       try {
         const posted = await this.postShareLinkIdempotently({
@@ -1096,26 +1289,60 @@ export class HostBridge {
           chatId,
           shareLink: record.shareLink,
         });
-        if (posted) {
-          record = await this.stateStore.update(state => {
-            const cur = state.prGroups[prKey]!;
-            cur.shareLinkPosted = true;
-            cur.updatedAt = new Date(this.now()).toISOString();
-            return { ...cur };
-          });
+        if (!posted) {
+          throw new Error('Share link rejected by trusted Feishu/Lark domain validation');
         }
+        record = await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.shareLinkPosted = true;
+          cur.updatedAt = new Date(this.now()).toISOString();
+          return { ...cur };
+        });
       } catch (err) {
-        warnings.push(`Share-link PR comment failed: ${formatSafeError(err, this.registry)}`);
+        const errMsg = `Share-link PR comment failed: ${formatSafeError(err, this.registry)}`;
+        await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey]!;
+          cur.status = 'creating';
+          cur.lastError = errMsg;
+          cur.updatedAt = new Date(this.now()).toISOString();
+        });
+        throw new Error(errMsg);
       }
     }
 
-    // Step 8: Mark PR group active atomically
+    // Final completion gate BEFORE Step 8: verify ALL required rule steps completed!
+    const missingReasons: string[] = [];
+    if ((rule.kickoffBotAppId || rule.setTopNotice) && !record.kickoffMessageId) {
+      missingReasons.push('kickoff_message_missing');
+    }
+    if (record.kickoffMessageId && record.kickoffVerified !== true) {
+      missingReasons.push('kickoff_not_verified');
+    }
+    if (rule.setTopNotice && !record.topNoticeSet) {
+      missingReasons.push('top_notice_not_set');
+    }
+    if (rule.postShareLinkToPr && record.shareLink && !record.shareLinkPosted) {
+      missingReasons.push('share_link_not_posted');
+    }
+    if (missingReasons.length > 0) {
+      const reason = missingReasons.join(',');
+      await this.stateStore.update(state => {
+        const cur = state.prGroups[prKey]!;
+        cur.status = 'creating';
+        cur.lastError = reason;
+        cur.updatedAt = new Date(this.now()).toISOString();
+      });
+      throw new Error(`PR group ${prKey} in ${chatId} incomplete (${reason}); remaining in creating state`);
+    }
+
+    // Step 8: Mark PR group active atomically ONLY after all required steps succeeded!
     record = await this.stateStore.update(state => {
       const cur = state.prGroups[prKey]!;
       cur.status = 'active';
       cur.lastHeadSha = pr.headSha;
       cur.updatedAt = new Date(this.now()).toISOString();
       delete cur.lastError;
+      delete cur.createAttempt;
       return { ...cur };
     });
 

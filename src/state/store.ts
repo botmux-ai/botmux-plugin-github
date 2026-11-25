@@ -46,8 +46,10 @@ export function makeEventDedupKey(
   prNumber: number,
   headSha: string,
   eventKind: EventKind,
+  generation = 1,
 ): string {
-  return `${repo.trim().toLowerCase()}#${prNumber}@${headSha.trim().toLowerCase()}:${eventKind}`;
+  const gen = Number.isInteger(generation) && generation >= 1 ? generation : 1;
+  return `${repo.trim().toLowerCase()}#${prNumber}@${headSha.trim().toLowerCase()}:${eventKind}:g${gen}`;
 }
 
 function pruneMapByTimestamp(map: Record<string, string>, maxEntries: number, minTsMs?: number): void {
@@ -230,9 +232,10 @@ export class StateStore {
     prNumber: number,
     headSha: string,
     eventKind: EventKind,
+    generation = 1,
   ): Promise<boolean> {
     const state = await this.load();
-    const key = makeEventDedupKey(repo, prNumber, headSha, eventKind);
+    const key = makeEventDedupKey(repo, prNumber, headSha, eventKind, generation);
     return Object.hasOwn(state.processedEvents, key);
   }
 
@@ -241,8 +244,9 @@ export class StateStore {
     prNumber: number,
     headSha: string,
     eventKind: EventKind,
+    generation = 1,
   ): Promise<void> {
-    const key = makeEventDedupKey(repo, prNumber, headSha, eventKind);
+    const key = makeEventDedupKey(repo, prNumber, headSha, eventKind, generation);
     await this.update(state => {
       Object.defineProperty(state.processedEvents, key, {
         value: new Date().toISOString(),

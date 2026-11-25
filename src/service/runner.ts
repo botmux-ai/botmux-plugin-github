@@ -32,9 +32,18 @@ import {
   isLoopbackRemoteAddress,
   readRawBodyBounded,
   verifyAndParseWebhookPayload,
+  verifyWebhookHostToken,
 } from '../engine/webhook.ts';
 import { readSecureFileIfExists } from '../security/fs.ts';
 import { SecretRegistry, defaultSecretRegistry, formatSafeError } from '../security/redact.ts';
+
+export interface ReloadOutcome {
+  ok: boolean;
+  mode?: string;
+  enabledRuleCount?: number;
+  portRestartRequired?: boolean;
+  error?: string;
+}
 
 export interface RunningServiceHandle {
   port: number;
@@ -42,7 +51,7 @@ export interface RunningServiceHandle {
   registry: SecretRegistry;
   watcher: GitHubWatcher;
   server: http.Server;
-  reload(): Promise<void>;
+  reload(): Promise<ReloadOutcome>;
   close(): Promise<void>;
 }
 
@@ -54,6 +63,10 @@ export interface StartServiceOptions {
   ghRunner?: GhCliRunner;
   larkClient?: LarkOpenApiClient;
   cliExec?: CliExecFn;
+  webhookHostToken?: string;
+  maxPendingPerKey?: number;
+  maxGlobalPending?: number;
+  maxInFlightDeliveries?: number;
   allowInsecureLocalApiForTests?: boolean;
   configPollIntervalMs?: number;
 }
@@ -115,6 +128,9 @@ export async function startGitHubService(
     ghRunner: opts.ghRunner,
     larkClient: opts.larkClient,
     cliExec: opts.cliExec,
+    maxPendingPerKey: opts.maxPendingPerKey,
+    maxGlobalPending: opts.maxGlobalPending,
+    maxInFlightDeliveries: opts.maxInFlightDeliveries,
     allowInsecureLocalApiForTests: allowInsecure,
   });
 
@@ -126,6 +142,12 @@ export async function startGitHubService(
   const maxInFlightRequests = 16;
   let boundPort = desiredPort;
 
+  // Strictly isolate webhook host token (BOTMUX_PLUGIN_WEBHOOK_TOKEN from deepcoldy/botmux#3830)
+  // from control API bearer tokens so a webhook caller can NEVER access /api/* control routes!
+  const webhookHostToken =
+    (opts.webhookHostToken ?? process.env.BOTMUX_PLUGIN_WEBHOOK_TOKEN)?.trim() || undefined;
+  if (webhookHostToken) registry.register(webhookHostToken);
+
   const hostBearerTokens = [
     process.env.BOTMUX_PLUGIN_SERVICE_TOKEN,
     process.env.BOTMUX_PLUGIN_CARD_ACTION_TOKEN,
@@ -135,25 +157,39 @@ export async function startGitHubService(
 
   const configPath = getConfigPath(pluginHome);
   let lastConfigHash = await computeFileHash(configPath);
-  let reloadPromise: Promise<void> | null = null;
+  let reloadPromise: Promise<ReloadOutcome> | null = null;
 
-  const reload = async (): Promise<void> => {
+  const reload = async (): Promise<ReloadOutcome> => {
     if (reloadPromise) return reloadPromise;
-    reloadPromise = (async () => {
+    reloadPromise = (async (): Promise<ReloadOutcome> => {
       try {
         const nextHash = await computeFileHash(configPath);
         const nextConfig = await loadPluginConfig(pluginHome, {
           allowInsecureLocalApiForTests: allowInsecure,
         });
+        // Commit config and lastConfigHash ONLY AFTER watcher.reloadConfig succeeds!
+        await watcher.reloadConfig(nextConfig);
         config = nextConfig;
         lastConfigHash = nextHash;
-        await watcher.reloadConfig(nextConfig);
+        return {
+          ok: true,
+          mode: watcher.getMode(),
+          enabledRuleCount: watcher.getEnabledRules().length,
+          portRestartRequired: config.service.port !== boundPort,
+        };
       } catch (err) {
-        await stateStore.appendEvent({
-          level: 'error',
-          kind: 'config_reload_error',
-          message: `Failed to reload config.json: ${formatSafeError(err, registry)}`,
-        });
+        const safeErr = formatSafeError(err, registry);
+        await stateStore
+          .appendEvent({
+            level: 'error',
+            kind: 'config_reload_error',
+            message: `Failed to reload config.json: ${safeErr}`,
+          })
+          .catch(() => {});
+        return {
+          ok: false,
+          error: safeErr,
+        };
       } finally {
         reloadPromise = null;
       }
@@ -237,7 +273,7 @@ export async function startGitHubService(
       return;
     }
 
-    // 2. GitHub Webhook receiver (loopback, authenticated by raw-byte HMAC-SHA256)
+    // 2. GitHub Webhook receiver (loopback, authenticated by BOTMUX_PLUGIN_WEBHOOK_TOKEN when injected + raw-byte HMAC-SHA256)
     if (isWebhookRoute(pathname)) {
       if (method !== 'POST') {
         sendJson(res, 405, { ok: false, error: 'method_not_allowed' });
@@ -245,6 +281,11 @@ export async function startGitHubService(
       }
       if (!isLoopbackRemoteAddress(req.socket?.remoteAddress)) {
         sendJson(res, 403, { ok: false, error: 'remote_not_loopback' });
+        return;
+      }
+      // Enforce BOTMUX_PLUGIN_WEBHOOK_TOKEN Bearer check when running behind Botmux #3830 webhook gateway
+      if (webhookHostToken && !verifyWebhookHostToken(req.headers, webhookHostToken)) {
+        sendJson(res, 401, { ok: false, error: 'invalid_webhook_host_token' });
         return;
       }
       // Fail closed BEFORE reading body if webhook is disabled or secret invalid
@@ -268,6 +309,9 @@ export async function startGitHubService(
       });
 
       if (!verdict.ok) {
+        if (verdict.status === 503) {
+          res.setHeader('Retry-After', '5');
+        }
         sendJson(res, verdict.status, { ok: false, error: verdict.reason ?? 'rejected' });
         return;
       }
@@ -289,15 +333,16 @@ export async function startGitHubService(
       }
 
       if (verdict.parsed?.event === 'pull_request' && verdict.parsed.pr && verdict.parsed.action) {
-        const accepted = watcher.enqueueWebhookPrEvent({
+        const admission = watcher.enqueueWebhookPrEvent({
           deliveryId: verdict.parsed.deliveryId,
           action: verdict.parsed.action,
           pr: verdict.parsed.pr,
         });
-        if (!accepted) {
-          sendJson(res, 503, {
+        if (!admission.accepted) {
+          res.setHeader('Retry-After', '5');
+          sendJson(res, admission.status, {
             ok: false,
-            error: 'service_stopping_or_rule_disabled',
+            error: admission.reason,
           });
           return;
         }
@@ -352,13 +397,8 @@ export async function startGitHubService(
 
       if (method === 'POST' && pathname === '/api/reload') {
         await readRawBodyBounded(req, { maxBytes: MAX_CONTROL_BODY_BYTES, timeoutMs: 5_000 });
-        await reload();
-        sendJson(res, 200, {
-          ok: true,
-          mode: watcher.getMode(),
-          enabledRuleCount: watcher.getEnabledRules().length,
-          portRestartRequired: config.service.port !== boundPort,
-        });
+        const reloadRes = await reload();
+        sendJson(res, reloadRes.ok ? 200 : 500, reloadRes);
         return;
       }
 
@@ -472,9 +512,13 @@ export async function startGitHubService(
   }
 
   const checkConfigReload = async () => {
-    const nextHash = await computeFileHash(configPath);
-    if (nextHash !== lastConfigHash) {
-      await reload();
+    try {
+      const nextHash = await computeFileHash(configPath);
+      if (nextHash !== lastConfigHash) {
+        await reload();
+      }
+    } catch {
+      // Never crash daemon with unhandledRejection on background config hash poll
     }
   };
 

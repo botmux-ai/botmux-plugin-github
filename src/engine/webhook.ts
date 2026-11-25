@@ -154,20 +154,32 @@ export interface WebhookValidationResult {
   parsed?: ParsedWebhookEvent;
 }
 
+export type DeliveryAcquireStatus = 'acquired' | 'duplicate' | 'overloaded';
+
 /**
- * Bounded in-memory LRU + TTL + in-flight delivery deduplicator.
+ * Bounded in-memory LRU + TTL + bounded/expiring in-flight delivery deduplicator.
  * Never records deliveries prior to signature verification and repo allowlist check.
  */
 export class DeliveryDedupCache {
   private readonly maxEntries: number;
   private readonly ttlMs: number;
+  private readonly maxInFlight: number;
+  private readonly inFlightTimeoutMs: number;
   private readonly entries = new Map<string, number>();
-  private readonly inFlight = new Set<string>();
+  private readonly inFlight = new Map<string, number>();
   private readonly now: () => number;
 
-  constructor(opts?: { maxEntries?: number; ttlMs?: number; now?: () => number }) {
-    this.maxEntries = opts?.maxEntries ?? 5_000;
-    this.ttlMs = opts?.ttlMs ?? 72 * 60 * 60 * 1000;
+  constructor(opts?: {
+    maxEntries?: number;
+    ttlMs?: number;
+    maxInFlight?: number;
+    inFlightTimeoutMs?: number;
+    now?: () => number;
+  }) {
+    this.maxEntries = Math.max(1, opts?.maxEntries ?? 5_000);
+    this.ttlMs = Math.max(1_000, opts?.ttlMs ?? 72 * 60 * 60 * 1000);
+    this.maxInFlight = Math.max(1, opts?.maxInFlight ?? Math.min(256, this.maxEntries));
+    this.inFlightTimeoutMs = Math.max(1_000, opts?.inFlightTimeoutMs ?? 5 * 60 * 1000);
     this.now = opts?.now ?? (() => Date.now());
   }
 
@@ -187,6 +199,9 @@ export class DeliveryDedupCache {
     for (const [k, exp] of this.entries.entries()) {
       if (exp <= nowMs) this.entries.delete(k);
     }
+    for (const [k, exp] of this.inFlight.entries()) {
+      if (exp <= nowMs) this.inFlight.delete(k);
+    }
     while (this.entries.size > this.maxEntries) {
       const oldest = this.entries.keys().next().value;
       if (!oldest) break;
@@ -194,13 +209,16 @@ export class DeliveryDedupCache {
     }
   }
 
-  tryAcquire(deliveryId: string): boolean {
+  tryAcquire(deliveryId: string): DeliveryAcquireStatus {
     this.prune();
     if (this.inFlight.has(deliveryId) || this.entries.has(deliveryId)) {
-      return false;
+      return 'duplicate';
     }
-    this.inFlight.add(deliveryId);
-    return true;
+    if (this.inFlight.size >= this.maxInFlight) {
+      return 'overloaded';
+    }
+    this.inFlight.set(deliveryId, this.now() + this.inFlightTimeoutMs);
+    return 'acquired';
   }
 
   commit(deliveryId: string): void {
@@ -217,6 +235,28 @@ export class DeliveryDedupCache {
     this.prune();
     return this.entries.size;
   }
+
+  inFlightSize(): number {
+    this.prune();
+    return this.inFlight.size;
+  }
+}
+
+/**
+ * Verifies the host-injected `Authorization: Bearer <BOTMUX_PLUGIN_WEBHOOK_TOKEN>`
+ * header mandated by deepcoldy/botmux#3830 when running behind Botmux's webhook gateway.
+ */
+export function verifyWebhookHostToken(
+  headers: http.IncomingHttpHeaders,
+  expectedToken: string,
+): boolean {
+  const authHeader = singleHeader(headers, 'authorization');
+  if (!authHeader || !authHeader.toLowerCase().startsWith('bearer ')) {
+    return false;
+  }
+  const provided = authHeader.slice(7).trim();
+  if (!provided) return false;
+  return safeTokenEqual(provided, expectedToken);
 }
 
 /**
@@ -394,7 +434,15 @@ export function verifyAndParseWebhookPayload(opts: {
   };
 
   // Deduplicate deliveryId ONLY after signature, schema, and repo allowlist checks pass!
-  if (!opts.dedupCache.tryAcquire(deliveryId)) {
+  const acquired = opts.dedupCache.tryAcquire(deliveryId);
+  if (acquired === 'overloaded') {
+    return {
+      status: 503,
+      ok: false,
+      reason: 'webhook_inflight_limit_exceeded',
+    };
+  }
+  if (acquired === 'duplicate') {
     return {
       status: 200,
       ok: true,

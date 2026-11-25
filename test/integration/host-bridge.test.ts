@@ -561,16 +561,24 @@ describe('HostBridge dual-core IPC, Bun $http_proxy bypass, crash-resume, Feishu
           };
         },
       });
-      const cliRes = await cliBridge.ensurePrReviewGroup({
-        rule: makeRule({ postShareLinkToPr: false, setTopNotice: false }),
-        pr: makePr(100, '--bind-working-dir=/etc; $(id)'),
-        githubClient: ghClient,
-      });
+      // While creator daemon is offline, CLI fallback MUST persist chatId + kickoffMessageId,
+      // and keep status='creating' (refusing to mark active until kickoff readback verifies om_cli_1!)
+      await assert.rejects(
+        () =>
+          cliBridge.ensurePrReviewGroup({
+            rule: makeRule({ postShareLinkToPr: false, setTopNotice: false }),
+            pr: makePr(100, '--bind-working-dir=/etc; $(id)'),
+            githubClient: ghClient,
+          }),
+        /Cannot verify kickoff message om_cli_1 while creator daemon is offline/,
+      );
       delete process.env.BUN_BE_BUN;
       delete process.env.BOTMUX_SESSION_ID;
 
-      assert.equal(cliRes.record.chatId, 'oc_cli_line1_recovered');
-      assert.equal(cliRes.record.kickoffMessageId, 'om_cli_1');
+      const persistedCli = (await stateStore.load()).prGroups['acme/core#100'];
+      assert.equal(persistedCli?.chatId, 'oc_cli_line1_recovered');
+      assert.equal(persistedCli?.kickoffMessageId, 'om_cli_1');
+      assert.equal(persistedCli?.status, 'creating', 'Unverified CLI kickoff must stay creating until daemon readback');
       assert.equal(capturedEnv.BUN_BE_BUN, undefined, 'BUN_BE_BUN must be stripped');
       assert.equal(capturedEnv.BOTMUX_SESSION_ID, undefined, 'BOTMUX_SESSION_ID must be stripped');
       assert.ok(capturedArgs.some(a => a.startsWith('--name=')), 'Untrusted group name must use --name= flag syntax');

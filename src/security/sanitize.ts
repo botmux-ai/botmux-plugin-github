@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { PullRequestInfo } from '../types.ts';
 import { MAX_IPC_TEXT_BYTES } from '../types.ts';
 
@@ -303,10 +304,34 @@ export function fitUntrustedPrMetadataXml(
   return formatUntrustedPrMetadataXml(pr, steps[steps.length - 1]);
 }
 
+export const MAX_GROUP_NAME_CODE_POINTS = 100;
+const MAX_DIRECT_MARKER_CODE_POINTS = 72;
+
 /**
- * Renders a safe Feishu/Lark group name (<= 100 code points), preserving the
- * canonical `[owner/repo#N]` or `PR #N owner/repo` prefix even under aggressive
- * truncation so existing-group deduplication stays anchored and unspoofable.
+ * Returns a deterministic, bounded canonical prefix for a PR group name:
+ * - Normal repos (`[owner/repo#N]` <= 72 code points): `[owner/repo#N]`
+ * - Long repos (up to GitHub's 39-char owner + 100-char repo):
+ *   `[<40-char-repo-prefix>~<8-hex-sha256>#N]` (always <= 64 code points even for 12-digit PR numbers),
+ *   so group names strictly obey `<= 100` code points while remaining uniquely matchable on GET /api/groups.
+ */
+export function makeCanonicalPrGroupPrefix(repo: string, prNumber: number): string {
+  const fullMarker = `[${repo}#${prNumber}]`;
+  if (Array.from(fullMarker).length <= MAX_DIRECT_MARKER_CODE_POINTS) {
+    return fullMarker;
+  }
+  const hash = createHash('sha256').update(repo.trim().toLowerCase()).digest('hex').slice(0, 8);
+  const prPart = `#${prNumber}`;
+  // Reserve brackets, `~`, 8-hex hash, and `#N`; cap total prefix <= 64 code points
+  const maxRepoPrefix = Math.max(8, 64 - 3 - hash.length - prPart.length);
+  const shortRepo = Array.from(repo).slice(0, maxRepoPrefix).join('');
+  return `[${shortRepo}~${hash}${prPart}]`;
+}
+
+/**
+ * Renders a safe Feishu/Lark group name STRICTLY <= 100 code points, preserving a
+ * trusted canonical PR prefix (either `[owner/repo#N]`, `PR #N owner/repo`, or the
+ * bounded hashed canonical marker for very long owner/repo names) so existing-group
+ * deduplication stays anchored, bounded, and unspoofable.
  */
 export function renderSafeGroupName(template: string, pr: PullRequestInfo): string {
   const safeTitle = sanitizeUntrustedText(pr.title, {
@@ -348,30 +373,47 @@ export function renderSafeGroupName(template: string, pr: PullRequestInfo): stri
 
   const cleaned = sanitizeUntrustedText(rendered, {
     allowNewlines: false,
-    maxCodePoints: 200,
+    maxCodePoints: 300,
     stripAngleBrackets: true,
     neutralizeMentions: true,
   });
 
-  const marker = `[${pr.repo}#${pr.number}]`;
-  const repoLower = pr.repo.toLowerCase();
+  const marker = makeCanonicalPrGroupPrefix(pr.repo, pr.number);
+  const fullMarker = `[${pr.repo}#${pr.number}]`;
+  const repoEsc = pr.repo.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const prPrefixRe = new RegExp(`^PR\\s*#${pr.number}\\s+${repoEsc}(?=$|[\\s\\-:])`, 'i');
   const startsWithTrustedPrefix =
     cleaned.toLowerCase().startsWith(marker.toLowerCase()) ||
-    new RegExp(`^PR\\s*#${pr.number}\\s+${repoLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=$|[\\s\\-:])`, 'i').test(
-      cleaned,
-    );
+    cleaned.toLowerCase().startsWith(fullMarker.toLowerCase()) ||
+    prPrefixRe.test(cleaned);
 
-  const candidate = startsWithTrustedPrefix ? cleaned : `${marker} ${cleaned}`.trim();
-  if (Array.from(candidate).length <= 100) {
-    return candidate;
+  if (startsWithTrustedPrefix && Array.from(cleaned).length <= MAX_GROUP_NAME_CODE_POINTS) {
+    return cleaned;
   }
 
-  const prefix = `${marker} `;
-  const remaining = Math.max(0, 100 - Array.from(prefix).length);
-  const stripped = candidate.toLowerCase().startsWith(prefix.toLowerCase())
-    ? candidate.slice(prefix.length)
-    : candidate;
-  return `${prefix}${truncateCodePoints(stripped, remaining)}`.trim();
+  // Build bounded string anchored with the guaranteed <= 64 cp canonical prefix
+  const prefixWithSpace = `${marker} `;
+  const prefixLen = Array.from(prefixWithSpace).length;
+  const remaining = Math.max(0, MAX_GROUP_NAME_CODE_POINTS - prefixLen);
+
+  // Strip redundant full/PR prefix from body portion before appending
+  let bodyPart = cleaned;
+  if (bodyPart.toLowerCase().startsWith(prefixWithSpace.toLowerCase())) {
+    bodyPart = bodyPart.slice(prefixWithSpace.length).trim();
+  } else if (bodyPart.toLowerCase().startsWith(`${fullMarker.toLowerCase()} `)) {
+    bodyPart = bodyPart.slice(fullMarker.length + 1).trim();
+  } else if (prPrefixRe.test(bodyPart)) {
+    bodyPart = bodyPart.replace(prPrefixRe, '').replace(/^[\s\-:]+/, '').trim();
+  }
+
+  const out =
+    remaining > 0 && bodyPart
+      ? `${prefixWithSpace}${truncateCodePoints(bodyPart, remaining)}`.trim()
+      : truncateCodePoints(marker, MAX_GROUP_NAME_CODE_POINTS);
+
+  return Array.from(out).length <= MAX_GROUP_NAME_CODE_POINTS
+    ? out
+    : truncateCodePoints(out, MAX_GROUP_NAME_CODE_POINTS);
 }
 
 /**

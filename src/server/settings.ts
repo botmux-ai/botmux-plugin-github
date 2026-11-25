@@ -116,7 +116,12 @@ async function callLocalService(opts: {
       return { kind: 'http_error', port, status: res.status, json };
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EHOSTUNREACH') {
+      // For mutating POST calls, ECONNRESET is an unknown outcome — never fall back to a duplicate executor!
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'EHOSTUNREACH' ||
+        (opts.method === 'GET' && code === 'ECONNRESET')
+      ) {
         continue;
       }
       return {

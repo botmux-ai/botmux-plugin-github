@@ -160,26 +160,16 @@ async function main() {
       commands,
     });
 
-    // 4. Emit dist/webhooks/index.json (compatible with upcoming Botmux core /webhook/plugin/github/*)
+    // 4. Emit dist/webhooks/index.json matching deepcoldy/botmux#3830 protocol:
+    //    mount-relative `path: "/events"` mapped to loopback `endpoint: "/webhooks/github"`.
     writeJson(join(stagingDir, 'webhooks', 'index.json'), {
       schemaVersion: 1,
-      endpoint: '/webhooks/github',
-      mountPath: '/webhook/plugin/github',
+      maxBodyBytes: 1048576,
       routes: [
         {
-          id: 'events',
-          path: '/webhook/plugin/github/events',
-          targetEndpoint: '/webhooks/github',
-          methods: ['POST'],
-          rawBody: true,
+          path: '/events',
+          endpoint: '/webhooks/github',
           maxBodyBytes: 1048576,
-          forwardHeaders: [
-            'x-github-event',
-            'x-github-delivery',
-            'x-hub-signature-256',
-            'content-type',
-            'user-agent',
-          ],
         },
       ],
     });

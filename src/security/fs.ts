@@ -1,5 +1,6 @@
 import { constants as fsConstants, promises as fsp } from 'node:fs';
-import { dirname, basename, join, resolve } from 'node:path';
+import os from 'node:os';
+import { dirname, basename, join, parse as parsePath, relative, resolve, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
 
 export type SecurityFsErrorCode =
@@ -51,29 +52,63 @@ function assertCleanPath(p: string): void {
   }
 }
 
+function getTrustedRootBoundary(absPath: string): string {
+  const candidates = [resolve(os.tmpdir()), resolve(os.homedir())];
+  if (process.platform === 'darwin') {
+    candidates.push('/tmp', '/var');
+  }
+  candidates.sort((a, b) => b.length - a.length);
+  for (const root of candidates) {
+    const prefix = root.endsWith(sep) ? root : `${root}${sep}`;
+    if (absPath === root || absPath.startsWith(prefix)) {
+      return root;
+    }
+  }
+  return parsePath(absPath).root;
+}
+
 /**
- * Ensures a sensitive directory exists with mode 0700, is not a symlink (and
- * does not traverse newly-created symlinked parents), and is owned by current UID.
+ * Walks every path component strictly below the OS/session trusted root boundary
+ * (os.tmpdir(), os.homedir(), or filesystem root) and rejects any existing symlink
+ * ancestor so writes/reads can never traverse a non-immediate ancestor symlink.
+ */
+async function assertNoAncestorSymlinks(absTargetPath: string): Promise<void> {
+  const abs = resolve(absTargetPath);
+  const boundary = getTrustedRootBoundary(abs);
+  const rel = relative(boundary, abs);
+  if (!rel || rel === '.') return;
+
+  const segments = rel.split(sep).filter(Boolean);
+  let cursor = boundary;
+  for (const segment of segments) {
+    cursor = join(cursor, segment);
+    try {
+      const lst = await fsp.lstat(cursor);
+      if (lst.isSymbolicLink()) {
+        throw new SecurityFsError('SYMLINK_REJECTED', `Refusing symlink in path: ${cursor}`);
+      }
+    } catch (err: unknown) {
+      if (err instanceof SecurityFsError) throw err;
+      if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+        // Remaining segments do not exist yet
+        break;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Ensures a sensitive directory exists with mode 0700, contains no symlink
+ * ancestors below the trusted root boundary, and is owned by current UID.
  */
 export async function ensureSecureDir(dirPath: string): Promise<void> {
   assertCleanPath(dirPath);
   const abs = resolve(dirPath);
 
-  // Check immediate parent if it already exists and is a symlink (prevents writing through symlinked pluginHome)
-  const parent = dirname(abs);
-  if (parent !== abs) {
-    try {
-      const parentStat = await fsp.lstat(parent);
-      if (parentStat.isSymbolicLink()) {
-        throw new SecurityFsError('SYMLINK_REJECTED', `Refusing symlink parent directory: ${parent}`);
-      }
-    } catch (err: unknown) {
-      if (err instanceof SecurityFsError) throw err;
-      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
-    }
-  }
-
+  await assertNoAncestorSymlinks(abs);
   await fsp.mkdir(abs, { recursive: true, mode: 0o700 });
+  await assertNoAncestorSymlinks(abs);
 
   // Open directory with O_NOFOLLOW (+ O_DIRECTORY where available) and fstat/fchmod the fd to avoid TOCTOU
   let dirHandle: fsp.FileHandle | undefined;
@@ -132,6 +167,7 @@ export async function readSecureFile(
 ): Promise<Buffer> {
   assertCleanPath(filePath);
   const abs = resolve(filePath);
+  await assertNoAncestorSymlinks(abs);
   let handle: fsp.FileHandle | undefined;
   try {
     handle = await fsp.open(abs, fsConstants.O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
@@ -308,8 +344,16 @@ async function readLockPayload(
       return { payload: null, mtimeMs: st.mtimeMs };
     }
     const raw = await handle.readFile({ encoding: 'utf8' });
-    const parsed = JSON.parse(raw) as Partial<LockPayload>;
+    let parsed: Partial<LockPayload>;
+    try {
+      parsed = JSON.parse(raw) as Partial<LockPayload>;
+    } catch {
+      // Empty/truncated lockfile from crash mid-write must still be eligible for staleMs recovery
+      return { payload: null, mtimeMs: st.mtimeMs };
+    }
     if (
+      parsed &&
+      typeof parsed === 'object' &&
       typeof parsed.pid === 'number' &&
       typeof parsed.startedAt === 'number' &&
       typeof parsed.nonce === 'string'

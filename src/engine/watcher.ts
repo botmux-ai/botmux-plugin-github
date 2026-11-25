@@ -22,7 +22,7 @@ import {
   GitHubRateLimitPausedError,
 } from '../github/client.ts';
 import type { GhCliRunner } from '../github/auth.ts';
-import { HostBridge } from '../host/bridge.ts';
+import { HostBridge, isPrGroupComplete } from '../host/bridge.ts';
 import type { DiscoveryOptions } from '../host/discovery.ts';
 import type { LarkOpenApiClient } from '../host/lark.ts';
 import type { CliExecFn } from '../host/bridge.ts';
@@ -41,7 +41,33 @@ export interface GitHubWatcherOptions {
   larkClient?: LarkOpenApiClient;
   cliExec?: CliExecFn;
   allowInsecureLocalApiForTests?: boolean;
+  maxPendingPerKey?: number;
+  maxGlobalPending?: number;
+  maxInFlightDeliveries?: number;
+  inFlightDeliveryTimeoutMs?: number;
+  taskTimeoutMs?: number;
   now?: () => number;
+}
+
+export type WebhookEnqueueVerdict =
+  | { accepted: true }
+  | { accepted: false; status: 429 | 503; reason: string };
+
+interface GenerationGuard {
+  gen: number;
+  signal?: AbortSignal;
+}
+
+class GenerationAbortedError extends Error {
+  readonly code = 'GENERATION_ABORTED';
+  constructor() {
+    super('Watcher generation aborted');
+    this.name = 'AbortError';
+  }
+}
+
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && (err.name === 'AbortError' || (err as { code?: string }).code === 'GENERATION_ABORTED');
 }
 
 export class GitHubWatcher {
@@ -62,6 +88,8 @@ export class GitHubWatcher {
 
   private pollTimers = new Map<string, ReturnType<typeof setInterval>>();
   private pollInFlight = new Map<string, Promise<SyncActionPreview[]>>();
+  private generation = 0;
+  private generationAbort = new AbortController();
   private started = false;
   private startedAtIso: string;
 
@@ -77,15 +105,25 @@ export class GitHubWatcher {
     this.now = opts.now ?? (() => Date.now());
     this.startedAtIso = new Date(this.now()).toISOString();
 
-    this.deliveryDedup = new DeliveryDedupCache({ now: this.now });
+    this.deliveryDedup = new DeliveryDedupCache({
+      maxInFlight: opts.maxInFlightDeliveries,
+      inFlightTimeoutMs: opts.inFlightDeliveryTimeoutMs,
+      now: this.now,
+    });
     this.queue = new PerPrSerialQueue({
       maxConcurrency: 4,
+      maxPendingPerKey: opts.maxPendingPerKey ?? 32,
+      maxGlobalPending: opts.maxGlobalPending ?? 256,
+      taskTimeoutMs: opts.taskTimeoutMs ?? 120_000,
       onError: (key, err) => {
-        void this.stateStore.appendEvent({
-          level: 'error',
-          kind: 'pr_queue_error',
-          message: `Error processing ${key}: ${formatSafeError(err, this.registry)}`,
-        });
+        if (isAbortError(err)) return;
+        void this.stateStore
+          .appendEvent({
+            level: 'error',
+            kind: 'pr_queue_error',
+            message: `Error processing ${key}: ${formatSafeError(err, this.registry)}`,
+          })
+          .catch(() => {});
       },
     });
   }
@@ -116,35 +154,58 @@ export class GitHubWatcher {
     return this.queue.stats();
   }
 
+  private bumpGeneration(): void {
+    this.generation++;
+    const oldAbort = this.generationAbort;
+    this.generationAbort = new AbortController();
+    oldAbort.abort();
+  }
+
+  private isGenerationCurrent(gen: number, signal?: AbortSignal): boolean {
+    return gen === this.generation && !signal?.aborted && !this.generationAbort.signal.aborted;
+  }
+
+  private assertGenerationCurrent(guard?: GenerationGuard): void {
+    if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) {
+      throw new GenerationAbortedError();
+    }
+  }
+
+  private buildClientsForConfig(
+    cfg: PluginConfig,
+    initialRateLimits?: RateLimitState,
+  ): { github: GitHubClient; bridge: HostBridge } {
+    registerConfigSecrets(cfg, this.registry);
+    const github = new GitHubClient({
+      auth: cfg.github,
+      proxy: cfg.proxy,
+      initialRateLimits,
+      registry: this.registry,
+      ghRunner: this.ghRunner,
+      allowInsecureLocalForTests: this.allowInsecureLocalApiForTests,
+      now: this.now,
+    });
+    const bridge = new HostBridge({
+      stateStore: this.stateStore,
+      discovery: this.discovery,
+      proxy: cfg.proxy,
+      registry: this.registry,
+      larkClient: this.larkClient,
+      cliExec: this.cliExec,
+      now: this.now,
+    });
+    return { github, bridge };
+  }
+
   private ensureClients(initialRateLimits?: RateLimitState): {
     github: GitHubClient;
     bridge: HostBridge;
   } {
-    // Register config secrets additively — NEVER clear the shared registry
-    // (which also holds controlToken, hostBearerTokens, dashboardSecret, and larkAppSecrets).
     registerConfigSecrets(this.config, this.registry);
-
-    if (!this.githubClient) {
-      this.githubClient = new GitHubClient({
-        auth: this.config.github,
-        proxy: this.config.proxy,
-        initialRateLimits,
-        registry: this.registry,
-        ghRunner: this.ghRunner,
-        allowInsecureLocalForTests: this.allowInsecureLocalApiForTests,
-        now: this.now,
-      });
-    }
-    if (!this.hostBridge) {
-      this.hostBridge = new HostBridge({
-        stateStore: this.stateStore,
-        discovery: this.discovery,
-        proxy: this.config.proxy,
-        registry: this.registry,
-        larkClient: this.larkClient,
-        cliExec: this.cliExec,
-        now: this.now,
-      });
+    if (!this.githubClient || !this.hostBridge) {
+      const built = this.buildClientsForConfig(this.config, initialRateLimits);
+      if (!this.githubClient) this.githubClient = built.github;
+      if (!this.hostBridge) this.hostBridge = built.bridge;
     }
     return { github: this.githubClient, bridge: this.hostBridge };
   }
@@ -153,11 +214,11 @@ export class GitHubWatcher {
    * Starts the watcher:
    * - If ZERO enabled repo rules exist, strictly stays in DORMANT mode:
    *   ZERO GitHub API requests, ZERO Feishu/daemon calls, ZERO poll timers!
-   * - If enabled repo rules exist, hydrates persisted state & starts per-repo timers.
    */
   async start(): Promise<void> {
     this.started = true;
     this.queue.resetForRestart();
+    this.bumpGeneration();
     registerConfigSecrets(this.config, this.registry);
 
     const state = await this.stateStore.load();
@@ -183,37 +244,82 @@ export class GitHubWatcher {
     this.armPollTimers();
   }
 
+  /**
+   * Hot-reloads config transactionally:
+   * - Pre-builds and validates candidate clients BEFORE touching state.json,
+   *   active timers, or generation so invalid configs never corrupt running state.
+   * - On commit, bumps generation & aborts old AbortController so in-flight polls
+   *   or webhook handlers immediately halt when switching active -> dormant.
+   */
   async reloadConfig(nextConfig: PluginConfig): Promise<ServiceMode> {
-    this.clearTimers();
-    this.config = nextConfig;
-    this.githubClient = null;
-    this.hostBridge = null;
-    registerConfigSecrets(nextConfig, this.registry);
+    const prevConfig = this.config;
+    const prevGithub = this.githubClient;
+    const prevBridge = this.hostBridge;
 
-    const enabled = this.getEnabledRules();
+    const nextEnabled = nextConfig.repos.filter(r => r.enabled);
+    const nextMode: ServiceMode = nextEnabled.length === 0 ? 'dormant' : 'active';
+
     const state = await this.stateStore.load();
-    const mode: ServiceMode = enabled.length === 0 ? 'dormant' : 'active';
+    const prevServiceSnapshot = { ...state.service };
 
-    await this.stateStore.update(s => {
-      s.service = {
-        ...s.service,
-        mode,
-        activeRepoCount: enabled.length,
-        lastReloadAt: new Date(this.now()).toISOString(),
-        lastHeartbeatAt: new Date(this.now()).toISOString(),
-      };
-    });
-
-    if (this.started && enabled.length > 0) {
-      this.ensureClients(state.rateLimits);
-      this.armPollTimers();
+    // 1. Validate & build candidate clients BEFORE mutating state.json or timers
+    let candidateGithub: GitHubClient | null = null;
+    let candidateBridge: HostBridge | null = null;
+    if (nextEnabled.length > 0) {
+      const built = this.buildClientsForConfig(nextConfig, state.rateLimits);
+      candidateGithub = built.github;
+      candidateBridge = built.bridge;
+    } else {
+      registerConfigSecrets(nextConfig, this.registry);
     }
-    return mode;
+
+    // 2. Persist state.json service mode; rollback cleanly if commit/arming fails
+    let stateUpdated = false;
+    try {
+      await this.stateStore.update(s => {
+        s.service = {
+          ...s.service,
+          mode: nextMode,
+          activeRepoCount: nextEnabled.length,
+          lastReloadAt: new Date(this.now()).toISOString(),
+          lastHeartbeatAt: new Date(this.now()).toISOString(),
+        };
+      });
+      stateUpdated = true;
+
+      this.clearTimers();
+      this.bumpGeneration();
+      this.config = nextConfig;
+      this.githubClient = candidateGithub;
+      this.hostBridge = candidateBridge;
+
+      if (this.started && nextEnabled.length > 0) {
+        this.armPollTimers();
+      }
+      return nextMode;
+    } catch (err) {
+      this.clearTimers();
+      this.config = prevConfig;
+      this.githubClient = prevGithub;
+      this.hostBridge = prevBridge;
+      if (stateUpdated) {
+        await this.stateStore
+          .update(s => {
+            s.service = prevServiceSnapshot;
+          })
+          .catch(() => {});
+      }
+      if (this.started && prevConfig.repos.some(r => r.enabled)) {
+        this.armPollTimers();
+      }
+      throw err;
+    }
   }
 
   async stop(drainTimeoutMs = 7_000): Promise<void> {
     this.started = false;
     this.clearTimers();
+    this.bumpGeneration();
     await this.queue.drain(drainTimeoutMs);
     if (this.githubClient) {
       await this.persistRateLimits();
@@ -235,22 +341,28 @@ export class GitHubWatcher {
         Math.max(15, rule.pollIntervalSec ?? this.config.service.pollIntervalSec) * 1000;
 
       void this.pollRepo(rule, { dryRun: false, waitForInFlight: false }).catch(err => {
-        void this.stateStore.appendEvent({
-          level: 'error',
-          kind: 'poll_error',
-          repo: rule.repo,
-          message: `Initial poll failed: ${formatSafeError(err, this.registry)}`,
-        });
+        if (isAbortError(err)) return;
+        void this.stateStore
+          .appendEvent({
+            level: 'error',
+            kind: 'poll_error',
+            repo: rule.repo,
+            message: `Initial poll failed: ${formatSafeError(err, this.registry)}`,
+          })
+          .catch(() => {});
       });
 
       const timer = setInterval(() => {
         void this.pollRepo(rule, { dryRun: false, waitForInFlight: false }).catch(err => {
-          void this.stateStore.appendEvent({
-            level: 'error',
-            kind: 'poll_error',
-            repo: rule.repo,
-            message: `Scheduled poll failed: ${formatSafeError(err, this.registry)}`,
-          });
+          if (isAbortError(err)) return;
+          void this.stateStore
+            .appendEvent({
+              level: 'error',
+              kind: 'poll_error',
+              repo: rule.repo,
+              message: `Scheduled poll failed: ${formatSafeError(err, this.registry)}`,
+            })
+            .catch(() => {});
         });
       }, intervalMs);
       timer.unref?.();
@@ -258,13 +370,15 @@ export class GitHubWatcher {
     }
   }
 
-  private async persistRateLimits(): Promise<void> {
+  private async persistRateLimits(expectedGen?: number): Promise<void> {
     if (!this.githubClient) return;
+    if (expectedGen !== undefined && !this.isGenerationCurrent(expectedGen)) return;
     const snap = this.githubClient.rateLimits.snapshot();
-    const mode = this.getMode();
     await this.stateStore.update(s => {
+      if (expectedGen !== undefined && !this.isGenerationCurrent(expectedGen)) return;
       s.rateLimits = snap;
-      s.service.mode = mode;
+      // Compute live mode INSIDE the lock so an old active poll can never overwrite dormant state!
+      s.service.mode = this.getMode();
       s.service.lastHeartbeatAt = new Date(this.now()).toISOString();
     });
   }
@@ -274,84 +388,296 @@ export class GitHubWatcher {
     return this.config.repos.find(r => normalizeRepoKey(r.repo) === target);
   }
 
+  private async invalidateRepoEtag(repoKey: string): Promise<void> {
+    this.githubClient?.clearEtagCache();
+    await this.stateStore
+      .update(s => {
+        const r = s.repos[repoKey];
+        if (r) {
+          delete r.etag;
+          delete r.etagKey;
+        }
+      })
+      .catch(() => {});
+  }
+
   /**
-   * Handles a verified GitHub pull_request webhook event by feeding it into the
-   * exact same FIFO per-PR serial queue used by the authoritative poller.
+   * Synchronously admits or rejects a verified GitHub pull_request webhook event.
+   * When the per-PR or global queue is full or draining, aborts deliveryDedup and
+   * returns `{ accepted: false, status: 429 | 503 }` synchronously so HTTP never
+   * sends a fake 202 Accepted!
    */
   enqueueWebhookPrEvent(opts: {
     deliveryId: string;
     action: string;
     pr: PullRequestInfo;
-  }): boolean {
+  }): WebhookEnqueueVerdict {
     const rule = this.findRuleByRepo(opts.pr.repo);
     if (!rule || !rule.enabled || this.queue.isStopping()) {
       this.deliveryDedup.abort(opts.deliveryId);
-      return false;
+      return {
+        accepted: false,
+        status: 503,
+        reason: 'service_stopping_or_rule_disabled',
+      };
     }
 
     const prKey = makePrKey(rule.repo, opts.pr.number);
-    const task = this.queue.enqueue(prKey, async () => {
-      await this.processWebhookPrEvent(rule, opts.action, opts.pr);
+    const enqueueGen = this.generation;
+    const enq = this.queue.tryEnqueue(prKey, async taskSignal => {
+      const guard: GenerationGuard = { gen: enqueueGen, signal: taskSignal };
+      this.assertGenerationCurrent(guard);
+      await this.processWebhookPrEvent(rule, opts.action, opts.pr, guard);
+      this.assertGenerationCurrent(guard);
       this.deliveryDedup.commit(opts.deliveryId);
       await this.stateStore.recordDelivery(opts.deliveryId);
     });
 
-    // Guarantee deliveryDedup.abort on any rejection (including queue full/drain or processing error)
-    task.catch(err => {
+    if (!enq.accepted) {
       this.deliveryDedup.abort(opts.deliveryId);
-      void this.stateStore.appendEvent({
-        level: 'error',
-        kind: 'webhook_process_error',
-        repo: rule.repo,
-        prNumber: opts.pr.number,
-        message: `Failed processing webhook ${opts.action}: ${formatSafeError(err, this.registry)}`,
-      });
+      if (enq.reason === 'draining') {
+        return { accepted: false, status: 503, reason: 'service_draining' };
+      }
+      return {
+        accepted: false,
+        status: 429,
+        reason: enq.reason === 'global_full' ? 'global_queue_full' : 'pr_queue_full',
+      };
+    }
+
+    enq.promise.catch(err => {
+      this.deliveryDedup.abort(opts.deliveryId);
+      // Do NOT mutate state.json or emit spurious errors if aborted by active->dormant reload!
+      if (isAbortError(err) || enqueueGen !== this.generation) {
+        return;
+      }
+      void this.invalidateRepoEtag(normalizeRepoKey(rule.repo));
+      void this.stateStore
+        .appendEvent({
+          level: 'error',
+          kind: 'webhook_process_error',
+          repo: rule.repo,
+          prNumber: opts.pr.number,
+          message: `Failed processing webhook ${opts.action}: ${formatSafeError(err, this.registry)}`,
+        })
+        .catch(() => {});
     });
 
-    return true;
+    return { accepted: true };
   }
 
+  /**
+   * Processes a webhook PR event WITHOUT committing `knownPrs` prematurely and
+   * re-verifying generation/AbortSignal after every async step:
+   * - Never commits `knownPrs` before group creation / action succeeds.
+   * - On `synchronize`, refuses to commit `knownPrs` (and clears repo ETag) whenever
+   *   a pending lifecycle transition could be masked (unknown PR, draft->ready,
+   *   closed->open, or non-active group).
+   * - Invalidates repo ETag on group create/reactivate so a subsequent close returning
+   *   open PRs to the previous list can never be masked by a 304 Not Modified!
+   */
   private async processWebhookPrEvent(
     rule: RepoRule,
     action: string,
     pr: PullRequestInfo,
+    guard: GenerationGuard,
   ): Promise<void> {
+    this.assertGenerationCurrent(guard);
+
     const repoKey = normalizeRepoKey(rule.repo);
+    const prKey = makePrKey(rule.repo, pr.number);
     const state = await this.stateStore.load();
+    this.assertGenerationCurrent(guard);
 
-    await this.stateStore.update(s => {
-      const repoState = s.repos[repoKey] ?? { knownPrs: {} };
-      repoState.knownPrs[String(pr.number)] = {
-        headSha: pr.headSha,
-        draft: pr.draft,
-        state: pr.state,
-        updatedAt: pr.updatedAt || new Date(this.now()).toISOString(),
-      };
-      s.repos[repoKey] = repoState;
-    });
+    const repoState = state.repos[repoKey];
+    const prevCursor = repoState?.knownPrs[String(pr.number)];
+    const existingGroup = state.prGroups[prKey];
 
-    if (action === 'opened' || action === 'ready_for_review' || action === 'reopened') {
+    const commitKnownCursor = async (stateVal: 'open' | 'closed' = pr.state) => {
+      this.assertGenerationCurrent(guard);
+      await this.stateStore.update(s => {
+        if (!this.isGenerationCurrent(guard.gen, guard.signal)) return;
+        const r = s.repos[repoKey] ?? { knownPrs: {} };
+        r.knownPrs[String(pr.number)] = {
+          headSha: pr.headSha,
+          draft: pr.draft,
+          state: stateVal,
+          updatedAt: pr.updatedAt || new Date(this.now()).toISOString(),
+        };
+        s.repos[repoKey] = r;
+      });
+    };
+
+    if (action === 'reopened') {
+      await this.handlePrReopened(rule, pr, false, guard);
+      this.assertGenerationCurrent(guard);
+      await commitKnownCursor('open');
+      await this.invalidateRepoEtag(repoKey);
+      return;
+    }
+
+    if (action === 'opened' || action === 'ready_for_review') {
       const triggerKind = action === 'ready_for_review' ? 'ready_for_review' : 'opened';
       const match = evaluateRepoRule(rule, pr, triggerKind);
-      if (!match.matched) return;
-      await this.handleGroupTrigger(rule, pr, triggerKind, false);
+      if (match.matched) {
+        await this.handleGroupTrigger(rule, pr, triggerKind, false, undefined, guard);
+        this.assertGenerationCurrent(guard);
+        await this.invalidateRepoEtag(repoKey);
+      }
+      await commitKnownCursor('open');
       return;
     }
 
-    if (action === 'synchronize' && rule.onNewCommit) {
-      const existingGroup = state.prGroups[makePrKey(rule.repo, pr.number)];
-      if (existingGroup && existingGroup.status === 'active' && existingGroup.chatId) {
-        await this.handleNewCommit(rule, pr, existingGroup.lastHeadSha, false);
+    if (action === 'synchronize') {
+      const masksDiscovery = !prevCursor && !existingGroup;
+      const masksDraftToReady = Boolean(prevCursor?.draft && !pr.draft && !existingGroup);
+      const masksReopen = Boolean(
+        prevCursor?.state === 'closed' && (!existingGroup || existingGroup.status === 'closed'),
+      );
+      const masksIncompleteGroup = Boolean(existingGroup && existingGroup.status !== 'active');
+
+      if (masksDiscovery || masksDraftToReady || masksReopen || masksIncompleteGroup) {
+        await this.invalidateRepoEtag(repoKey);
+        return;
       }
+
+      if (rule.onNewCommit && existingGroup && existingGroup.status === 'active' && existingGroup.chatId) {
+        await this.handleNewCommit(rule, pr, existingGroup.lastHeadSha, false, guard);
+      }
+      await commitKnownCursor('open');
       return;
     }
 
-    if (action === 'closed' && rule.onPrClosed) {
-      const existingGroup = state.prGroups[makePrKey(rule.repo, pr.number)];
-      if (existingGroup && existingGroup.status === 'active' && existingGroup.chatId) {
-        await this.handlePrClosed(rule, pr, false);
+    if (action === 'closed') {
+      if (existingGroup) {
+        if (rule.onPrClosed && existingGroup.chatId) {
+          await this.handlePrClosed(rule, pr, false, guard);
+        } else if (existingGroup.status !== 'closed') {
+          await this.markGroupClosedIdempotently(rule.repo, pr.number, pr.headSha, guard);
+        }
       }
+      await commitKnownCursor('closed');
     }
+  }
+
+  private async markGroupClosedIdempotently(
+    repo: string,
+    prNumber: number,
+    headSha: string,
+    guard?: GenerationGuard,
+  ): Promise<void> {
+    this.assertGenerationCurrent(guard);
+    const prKey = makePrKey(repo, prNumber);
+    await this.stateStore.update(s => {
+      if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+      const g = s.prGroups[prKey];
+      if (g) {
+        g.status = 'closed';
+        g.lastHeadSha = headSha;
+        g.updatedAt = new Date(this.now()).toISOString();
+      }
+    });
+  }
+
+  /**
+   * Explicit reopen lifecycle handler (used by BOTH poller and webhook):
+   * - If a group exists for this PR, increments `lifecycleGeneration` and either
+   *   completes unfinished kickoff/top-notice steps via HostBridge or reactivates directly.
+   * - If no group exists yet, evaluates `opened` rule and creates a group with the new generation.
+   */
+  private async handlePrReopened(
+    rule: RepoRule,
+    pr: PullRequestInfo,
+    dryRun: boolean,
+    guard?: GenerationGuard,
+  ): Promise<SyncActionPreview> {
+    this.assertGenerationCurrent(guard);
+    const prKey = makePrKey(rule.repo, pr.number);
+    const state = await this.stateStore.load();
+    this.assertGenerationCurrent(guard);
+    const existingGroup = state.prGroups[prKey];
+
+    if (existingGroup && existingGroup.chatId) {
+      if (dryRun) {
+        return {
+          repo: rule.repo,
+          prNumber: pr.number,
+          action: 'resume_group',
+          reason: 'reopened_reactivate',
+          chatId: existingGroup.chatId,
+        };
+      }
+
+      const nextGen = (existingGroup.lifecycleGeneration ?? 1) + 1;
+      const needsCompletion = !isPrGroupComplete(
+        { ...existingGroup, status: 'active' },
+        rule,
+      );
+
+      if (needsCompletion) {
+        // Bump generation and set status='creating' BEFORE delegating to bridge even if
+        // existingGroup.status had not transitioned to 'closed' yet (e.g. onPrClosed was false).
+        await this.stateStore.update(s => {
+          if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+          const g = s.prGroups[prKey];
+          if (g) {
+            g.lifecycleGeneration = nextGen;
+            g.status = 'creating';
+            g.lastHeadSha = pr.headSha;
+            g.updatedAt = new Date(this.now()).toISOString();
+          }
+        });
+        this.assertGenerationCurrent(guard);
+        const { github, bridge } = this.ensureClients(state.rateLimits);
+        const res = await bridge.ensurePrReviewGroup({ rule, pr, githubClient: github });
+        return {
+          repo: rule.repo,
+          prNumber: pr.number,
+          action: 'resume_group',
+          reason: 'reopened_resumed_incomplete',
+          chatId: res.record.chatId,
+          groupName: res.record.groupName,
+        };
+      }
+
+      await this.stateStore.update(s => {
+        if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+        const g = s.prGroups[prKey];
+        if (g) {
+          g.status = 'active';
+          g.lifecycleGeneration = nextGen;
+          g.lastHeadSha = pr.headSha;
+          g.updatedAt = new Date(this.now()).toISOString();
+        }
+      });
+      await this.stateStore.appendEvent({
+        level: 'info',
+        kind: 'pr_reopened_reactivated',
+        repo: rule.repo,
+        prNumber: pr.number,
+        chatId: existingGroup.chatId,
+        message: `Reactivated group ${existingGroup.chatId} on PR reopen (generation=${nextGen})`,
+      });
+      return {
+        repo: rule.repo,
+        prNumber: pr.number,
+        action: 'resume_group',
+        reason: 'reopened_reactivated',
+        chatId: existingGroup.chatId,
+      };
+    }
+
+    const match = evaluateRepoRule(rule, pr, 'opened');
+    if (!match.matched) {
+      return {
+        repo: rule.repo,
+        prNumber: pr.number,
+        action: 'skip_filtered',
+        reason: match.reason,
+      };
+    }
+    const nextGen = (existingGroup?.lifecycleGeneration ?? 1) + 1;
+    return this.handleGroupTrigger(rule, pr, 'opened', dryRun, nextGen, guard);
   }
 
   private async checkAndRecordCreationQuota(repoKey: string): Promise<boolean> {
@@ -377,27 +703,34 @@ export class GitHubWatcher {
     pr: PullRequestInfo,
     eventKind: EventKind,
     dryRun: boolean,
+    generationOverride?: number,
+    guard?: GenerationGuard,
   ): Promise<SyncActionPreview> {
+    this.assertGenerationCurrent(guard);
     const prKey = makePrKey(rule.repo, pr.number);
     const repoKey = normalizeRepoKey(rule.repo);
     const state = await this.stateStore.load();
-    const existingGroup = state.prGroups[prKey];
-    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, eventKind);
+    this.assertGenerationCurrent(guard);
 
-    if (existingGroup?.status === 'active' && existingGroup.chatId) {
+    const existingGroup = state.prGroups[prKey];
+    const generation = generationOverride ?? existingGroup?.lifecycleGeneration ?? 1;
+    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, eventKind, generation);
+
+    if (isPrGroupComplete(existingGroup, rule)) {
       return {
         repo: rule.repo,
         prNumber: pr.number,
         action: 'skip_dedup',
         reason: 'group_already_active',
-        chatId: existingGroup.chatId,
+        chatId: existingGroup!.chatId,
       };
     }
 
+    const incompleteExisting = Boolean(existingGroup && !isPrGroupComplete(existingGroup, rule));
     if (
       eventKind !== 'manual_open' &&
-      Object.hasOwn(state.processedEvents, dedupKey) &&
-      existingGroup?.status !== 'creating'
+      !incompleteExisting &&
+      Object.hasOwn(state.processedEvents, dedupKey)
     ) {
       return {
         repo: rule.repo,
@@ -412,7 +745,7 @@ export class GitHubWatcher {
       return {
         repo: rule.repo,
         prNumber: pr.number,
-        action: existingGroup?.status === 'creating' ? 'resume_group' : 'create_group',
+        action: incompleteExisting ? 'resume_group' : 'create_group',
         groupName,
         ...(existingGroup?.chatId ? { chatId: existingGroup.chatId } : {}),
       };
@@ -420,6 +753,7 @@ export class GitHubWatcher {
 
     if (!existingGroup && eventKind !== 'manual_open') {
       const allowed = await this.checkAndRecordCreationQuota(repoKey);
+      this.assertGenerationCurrent(guard);
       if (!allowed) {
         await this.stateStore.appendEvent({
           level: 'warn',
@@ -437,6 +771,7 @@ export class GitHubWatcher {
       }
     }
 
+    this.assertGenerationCurrent(guard);
     const { github, bridge } = this.ensureClients(state.rateLimits);
     const result = await bridge.ensurePrReviewGroup({
       rule,
@@ -444,7 +779,8 @@ export class GitHubWatcher {
       githubClient: github,
     });
 
-    await this.stateStore.markEventProcessed(rule.repo, pr.number, pr.headSha, eventKind);
+    const finalGen = result.record.lifecycleGeneration ?? generation;
+    await this.stateStore.markEventProcessed(rule.repo, pr.number, pr.headSha, eventKind, finalGen);
     return {
       repo: rule.repo,
       prNumber: pr.number,
@@ -459,21 +795,16 @@ export class GitHubWatcher {
     pr: PullRequestInfo,
     previousHeadSha: string,
     dryRun: boolean,
+    guard?: GenerationGuard,
   ): Promise<SyncActionPreview> {
+    this.assertGenerationCurrent(guard);
     if (previousHeadSha === pr.headSha) {
       return { repo: rule.repo, prNumber: pr.number, action: 'skip_dedup', reason: 'same_head_sha' };
     }
     const prKey = makePrKey(rule.repo, pr.number);
     const state = await this.stateStore.load();
-    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, 'new_commit');
-    if (Object.hasOwn(state.processedEvents, dedupKey)) {
-      return {
-        repo: rule.repo,
-        prNumber: pr.number,
-        action: 'skip_dedup',
-        reason: 'commit_already_notified',
-      };
-    }
+    this.assertGenerationCurrent(guard);
+
     const group = state.prGroups[prKey];
     if (!group?.chatId || group.status !== 'active') {
       return {
@@ -481,6 +812,17 @@ export class GitHubWatcher {
         prNumber: pr.number,
         action: 'skip_filtered',
         reason: 'no_active_group',
+      };
+    }
+
+    const generation = group.lifecycleGeneration ?? 1;
+    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, 'new_commit', generation);
+    if (Object.hasOwn(state.processedEvents, dedupKey)) {
+      return {
+        repo: rule.repo,
+        prNumber: pr.number,
+        action: 'skip_dedup',
+        reason: 'commit_already_notified',
       };
     }
 
@@ -493,6 +835,7 @@ export class GitHubWatcher {
       };
     }
 
+    this.assertGenerationCurrent(guard);
     const { bridge } = this.ensureClients(state.rateLimits);
     const content = buildNewCommitMessage(pr, previousHeadSha);
     await bridge.sendFollowUpUpdate({
@@ -533,29 +876,56 @@ export class GitHubWatcher {
     };
   }
 
+  /**
+   * Handles PR closure with generation-scoped dedup AND idempotent `closed` state landing:
+   * even if the close notification for this (headSha, generation) was already sent,
+   * `prGroups[prKey].status` is ALWAYS persisted as `'closed'` so state never diverges.
+   */
   private async handlePrClosed(
     rule: RepoRule,
     pr: PullRequestInfo,
     dryRun: boolean,
+    guard?: GenerationGuard,
   ): Promise<SyncActionPreview> {
+    this.assertGenerationCurrent(guard);
     const prKey = makePrKey(rule.repo, pr.number);
     const state = await this.stateStore.load();
-    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, 'pr_closed');
-    if (Object.hasOwn(state.processedEvents, dedupKey)) {
-      return {
-        repo: rule.repo,
-        prNumber: pr.number,
-        action: 'skip_dedup',
-        reason: 'close_already_notified',
-      };
-    }
+    this.assertGenerationCurrent(guard);
+
     const group = state.prGroups[prKey];
-    if (!group?.chatId || group.status !== 'active') {
+    if (!group?.chatId) {
+      if (group && !dryRun && group.status !== 'closed') {
+        await this.markGroupClosedIdempotently(rule.repo, pr.number, pr.headSha, guard);
+      }
       return {
         repo: rule.repo,
         prNumber: pr.number,
         action: 'skip_filtered',
         reason: 'no_active_group',
+      };
+    }
+    if (group.status === 'closed') {
+      return {
+        repo: rule.repo,
+        prNumber: pr.number,
+        action: 'skip_dedup',
+        reason: 'already_closed',
+        chatId: group.chatId,
+      };
+    }
+
+    const generation = group.lifecycleGeneration ?? 1;
+    const dedupKey = makeEventDedupKey(rule.repo, pr.number, pr.headSha, 'pr_closed', generation);
+    if (Object.hasOwn(state.processedEvents, dedupKey)) {
+      if (!dryRun) {
+        await this.markGroupClosedIdempotently(rule.repo, pr.number, pr.headSha, guard);
+      }
+      return {
+        repo: rule.repo,
+        prNumber: pr.number,
+        action: 'skip_dedup',
+        reason: 'close_already_notified',
+        chatId: group.chatId,
       };
     }
 
@@ -568,6 +938,7 @@ export class GitHubWatcher {
       };
     }
 
+    this.assertGenerationCurrent(guard);
     const { bridge } = this.ensureClients(state.rateLimits);
     const content = buildPrClosedMessage(pr);
     await bridge.sendFollowUpUpdate({
@@ -611,9 +982,12 @@ export class GitHubWatcher {
 
   /**
    * Authoritative repository poll:
-   * - Uses If-None-Match ETag (304 Not Modified consumes zero quota)
-   * - First-run baseline capture snapshots ALL current open PRs without creating any groups!
-   * - Never strands failed/creating PRs behind a 304 Not Modified ETag.
+   * - Captures `pollGen` + `AbortSignal` so hot-reloading active->dormant aborts
+   *   in-flight pagination & prevents any post-dormant external calls or state writes.
+   * - Validates multi-page repositories across all pages (including legacy state
+   *   cold restart inference and 3+ pages).
+   * - Syncs closed status for ALL non-closed groups (including `onPrClosed: false`
+   *   and `creating`) and never advances ETag on ANY per-PR error or close failure.
    */
   async pollRepo(
     rule: RepoRule,
@@ -632,8 +1006,16 @@ export class GitHubWatcher {
       }
     }
 
+    const pollGen = this.generation;
+    const signal = this.generationAbort.signal;
+    const pollGuard: GenerationGuard = { gen: pollGen, signal };
+
     const runPoll = async (): Promise<SyncActionPreview[]> => {
+      if (!this.isGenerationCurrent(pollGen, signal)) return [];
+
       const state = await this.stateStore.load();
+      if (!this.isGenerationCurrent(pollGen, signal)) return [];
+
       const { github } = this.ensureClients(state.rateLimits);
       const [owner, repo] = rule.repo.split('/');
       if (!owner || !repo) {
@@ -645,17 +1027,29 @@ export class GitHubWatcher {
       const filtersChanged = Boolean(
         repoState.filterHash && repoState.filterHash !== currentFilterHash,
       );
-      const hasCreatingGroups = Object.values(state.prGroups).some(
-        g => normalizeRepoKey(g.repo) === repoKey && g.status === 'creating',
+      const hasIncompleteGroups = Object.values(state.prGroups).some(
+        g =>
+          normalizeRepoKey(g.repo) === repoKey &&
+          g.status !== 'closed' &&
+          !isPrGroupComplete(g, rule),
       );
 
-      // Bypass ETag on dryRun, explicit bypassEtag, filter change, missing baseline,
-      // OR when any crash-interrupted 'creating' group needs resumption!
+      // Infer previousPageCount from open knownPrs on legacy state.json lacking lastPageCount
+      let inferredPageCount = repoState.lastPageCount;
+      if (inferredPageCount === undefined) {
+        const openKnownCount = Object.values(repoState.knownPrs ?? {}).filter(
+          c => c.state === 'open',
+        ).length;
+        if (openKnownCount >= 100) {
+          inferredPageCount = Math.floor(openKnownCount / 100) + 1;
+        }
+      }
+
       const useEtag =
         !dryRun &&
         !opts?.bypassEtag &&
         !filtersChanged &&
-        !hasCreatingGroups &&
+        !hasIncompleteGroups &&
         Boolean(repoState.baselineCapturedAt);
 
       let listRes;
@@ -663,14 +1057,21 @@ export class GitHubWatcher {
         listRes = await github.listOpenPullRequests(owner, repo, {
           persistedEtag: useEtag ? repoState.etag : undefined,
           persistedEtagKey: useEtag ? repoState.etagKey : undefined,
+          previousPageCount: inferredPageCount,
           bypassEtag: !useEtag,
           priority: 'core',
+          signal,
         });
       } catch (err) {
-        await this.persistRateLimits();
+        if (isAbortError(err) || !this.isGenerationCurrent(pollGen, signal)) {
+          return [];
+        }
+        await this.persistRateLimits(pollGen);
+        if (!this.isGenerationCurrent(pollGen, signal)) return [];
         if (err instanceof GitHubRateLimitPausedError) {
           if (!dryRun) {
             await this.stateStore.update(s => {
+              if (!this.isGenerationCurrent(pollGen, signal)) return;
               const r = s.repos[repoKey] ?? { knownPrs: {} };
               r.lastPollAt = new Date(this.now()).toISOString();
               r.lastPollStatus = 'rate_limited';
@@ -683,6 +1084,7 @@ export class GitHubWatcher {
         const safeErr = formatSafeError(err, this.registry);
         if (!dryRun) {
           await this.stateStore.update(s => {
+            if (!this.isGenerationCurrent(pollGen, signal)) return;
             const r = s.repos[repoKey] ?? { knownPrs: {} };
             r.lastPollAt = new Date(this.now()).toISOString();
             r.lastPollStatus = 'error';
@@ -693,14 +1095,18 @@ export class GitHubWatcher {
         return [{ repo: rule.repo, action: 'error', reason: safeErr }];
       }
 
-      await this.persistRateLimits();
+      if (!this.isGenerationCurrent(pollGen, signal)) return [];
+      await this.persistRateLimits(pollGen);
+      if (!this.isGenerationCurrent(pollGen, signal)) return [];
 
       if (listRes.notModified) {
         if (!dryRun) {
           await this.stateStore.update(s => {
+            if (!this.isGenerationCurrent(pollGen, signal)) return;
             const r = s.repos[repoKey] ?? { knownPrs: {} };
             r.etag = listRes.etag ?? r.etag;
             r.etagKey = listRes.etagKey;
+            r.lastPageCount = listRes.pageCount;
             r.lastPollAt = new Date(this.now()).toISOString();
             r.lastPollStatus = 'not_modified';
             delete r.lastError;
@@ -712,6 +1118,7 @@ export class GitHubWatcher {
 
       // FIRST-RUN BASELINE SNAPSHOT: capture all currently open PRs WITHOUT creating any groups!
       if (!repoState.baselineCapturedAt) {
+        if (!this.isGenerationCurrent(pollGen, signal)) return [];
         if (listRes.truncated) {
           await this.stateStore.appendEvent({
             level: 'warn',
@@ -721,8 +1128,9 @@ export class GitHubWatcher {
           });
         }
         const nowIso = new Date(this.now()).toISOString();
-        if (!dryRun) {
+        if (!dryRun && this.isGenerationCurrent(pollGen, signal)) {
           await this.stateStore.update(s => {
+            if (!this.isGenerationCurrent(pollGen, signal)) return;
             const knownPrs: Record<
               string,
               { headSha: string; draft: boolean; state: 'open' | 'closed'; updatedAt: string }
@@ -738,6 +1146,7 @@ export class GitHubWatcher {
             s.repos[repoKey] = {
               etag: listRes.etag,
               etagKey: listRes.etagKey,
+              lastPageCount: listRes.pageCount,
               filterHash: currentFilterHash,
               baselineCapturedAt: nowIso,
               lastPollAt: nowIso,
@@ -769,17 +1178,25 @@ export class GitHubWatcher {
 
       const runQueuedPr = async (
         prNumber: number,
-        fn: () => Promise<SyncActionPreview>,
+        fn: (guard: GenerationGuard) => Promise<SyncActionPreview>,
       ): Promise<void> => {
+        if (!this.isGenerationCurrent(pollGen, signal)) return;
         if (dryRun) {
-          actions.push(await fn());
+          actions.push(await fn(pollGuard));
           return;
         }
         const prKey = makePrKey(rule.repo, prNumber);
         try {
-          const action = await this.queue.enqueue(prKey, fn);
-          actions.push(action);
+          const action = await this.queue.enqueue(prKey, async taskSignal => {
+            const combinedGuard: GenerationGuard = { gen: pollGen, signal: taskSignal };
+            this.assertGenerationCurrent(combinedGuard);
+            return fn(combinedGuard);
+          });
+          if (this.isGenerationCurrent(pollGen, signal)) {
+            actions.push(action);
+          }
         } catch (err) {
+          if (isAbortError(err) || !this.isGenerationCurrent(pollGen, signal)) return;
           const reason = formatSafeError(err, this.registry);
           failedPrNumbers.add(prNumber);
           if (!firstErrorReason) firstErrorReason = reason;
@@ -788,14 +1205,23 @@ export class GitHubWatcher {
       };
 
       for (const pr of listRes.pulls) {
+        if (!this.isGenerationCurrent(pollGen, signal)) return [];
         openNumbers.add(pr.number);
         const prevCursor = repoState.knownPrs[String(pr.number)];
         const prKey = makePrKey(rule.repo, pr.number);
         const existingGroup = state.prGroups[prKey];
 
-        // Case 1: Incomplete crash-interrupted 'creating' group -> resume immediately
-        if (existingGroup?.status === 'creating') {
-          await runQueuedPr(pr.number, () => this.handleGroupTrigger(rule, pr, 'opened', dryRun));
+        // Case 0: Closed PR or closed group reopened!
+        if (prevCursor?.state === 'closed' || existingGroup?.status === 'closed') {
+          await runQueuedPr(pr.number, g => this.handlePrReopened(rule, pr, dryRun, g));
+          continue;
+        }
+
+        // Case 1: Incomplete crash-interrupted or unfinished group -> resume immediately
+        if (existingGroup && !isPrGroupComplete(existingGroup, rule)) {
+          await runQueuedPr(pr.number, g =>
+            this.handleGroupTrigger(rule, pr, 'opened', dryRun, undefined, g),
+          );
           continue;
         }
 
@@ -810,8 +1236,8 @@ export class GitHubWatcher {
               reason: match.reason,
             });
           } else {
-            await runQueuedPr(pr.number, () =>
-              this.handleGroupTrigger(rule, pr, 'opened', dryRun),
+            await runQueuedPr(pr.number, g =>
+              this.handleGroupTrigger(rule, pr, 'opened', dryRun, undefined, g),
             );
           }
           continue;
@@ -828,8 +1254,8 @@ export class GitHubWatcher {
               reason: match.reason,
             });
           } else {
-            await runQueuedPr(pr.number, () =>
-              this.handleGroupTrigger(rule, pr, 'ready_for_review', dryRun),
+            await runQueuedPr(pr.number, g =>
+              this.handleGroupTrigger(rule, pr, 'ready_for_review', dryRun, undefined, g),
             );
           }
           continue;
@@ -841,18 +1267,20 @@ export class GitHubWatcher {
           existingGroup?.status === 'active' &&
           existingGroup.lastHeadSha !== pr.headSha
         ) {
-          await runQueuedPr(pr.number, () =>
-            this.handleNewCommit(rule, pr, existingGroup.lastHeadSha, dryRun),
+          await runQueuedPr(pr.number, g =>
+            this.handleNewCommit(rule, pr, existingGroup.lastHeadSha, dryRun, g),
           );
         }
       }
 
-      // Case 5: Optional onPrClosed for active PR groups that vanished from a complete open PR scan
-      if (rule.onPrClosed && !listRes.truncated) {
+      // Case 5: ALL non-closed groups missing from a non-truncated open PR scan
+      // (keeps prGroups in sync even when onPrClosed is false or group was stuck in creating!)
+      if (!listRes.truncated && this.isGenerationCurrent(pollGen, signal)) {
         for (const group of Object.values(state.prGroups)) {
+          if (!this.isGenerationCurrent(pollGen, signal)) return [];
           if (
             normalizeRepoKey(group.repo) !== repoKey ||
-            group.status !== 'active' ||
+            group.status === 'closed' ||
             openNumbers.has(group.prNumber)
           ) {
             continue;
@@ -860,13 +1288,28 @@ export class GitHubWatcher {
           try {
             const latestPr = await github.getPullRequest(owner, repo, group.prNumber, {
               priority: 'non_core',
+              signal,
             });
+            if (!this.isGenerationCurrent(pollGen, signal)) return [];
             if (latestPr.state === 'closed') {
-              await runQueuedPr(group.prNumber, () =>
-                this.handlePrClosed(rule, latestPr, dryRun),
-              );
+              if (rule.onPrClosed && group.chatId && group.status === 'active') {
+                await runQueuedPr(group.prNumber, g =>
+                  this.handlePrClosed(rule, latestPr, dryRun, g),
+                );
+              } else if (!dryRun) {
+                await this.markGroupClosedIdempotently(
+                  rule.repo,
+                  group.prNumber,
+                  latestPr.headSha,
+                  pollGuard,
+                );
+              }
             }
           } catch (err) {
+            if (isAbortError(err) || !this.isGenerationCurrent(pollGen, signal)) return [];
+            const reason = formatSafeError(err, this.registry);
+            failedPrNumbers.add(group.prNumber);
+            if (!firstErrorReason) firstErrorReason = reason;
             if (err instanceof GitHubRateLimitPausedError) {
               actions.push({
                 repo: rule.repo,
@@ -874,13 +1317,22 @@ export class GitHubWatcher {
                 action: 'skip_rate_limited',
                 reason: err.reason,
               });
+            } else {
+              actions.push({
+                repo: rule.repo,
+                prNumber: group.prNumber,
+                action: 'error',
+                reason,
+              });
             }
           }
         }
       }
 
+      if (!this.isGenerationCurrent(pollGen, signal)) return [];
+
       // Persist updated repo cursor & ETag ONLY cleanly:
-      // If any PR task failed, do NOT advance ETag or record failed new PRs in knownPrs!
+      // If ANY PR task or close confirmation failed, DO NOT advance ETag!
       if (!dryRun) {
         const hadPrError = failedPrNumbers.size > 0;
         const nowIso = new Date(this.now()).toISOString();
@@ -888,15 +1340,18 @@ export class GitHubWatcher {
           github.clearEtagCache();
         }
         await this.stateStore.update(s => {
+          if (!this.isGenerationCurrent(pollGen, signal)) return;
           const r = s.repos[repoKey] ?? { knownPrs: {} };
           if (!hadPrError) {
             r.etag = listRes.etag;
             r.etagKey = listRes.etagKey;
+            r.lastPageCount = listRes.pageCount;
             r.lastPollStatus = 'ok';
             delete r.lastError;
           } else {
             delete r.etag;
             delete r.etagKey;
+            r.lastPageCount = listRes.pageCount;
             r.lastPollStatus = 'error';
             r.lastError = firstErrorReason ?? 'one or more PR actions failed';
           }
@@ -905,7 +1360,6 @@ export class GitHubWatcher {
 
           const nextKnown: typeof r.knownPrs = { ...r.knownPrs };
           for (const pr of listRes.pulls) {
-            // Do not mark a newly failed PR as known so the next poll retries it!
             if (failedPrNumbers.has(pr.number)) continue;
             nextKnown[String(pr.number)] = {
               headSha: pr.headSha,
@@ -992,7 +1446,8 @@ export class GitHubWatcher {
 
   /**
    * Explicit manual PR trigger (`github:open-pr owner/repo#N [--dry-run]` or Dashboard action).
-   * Explicitly allowed to backfill pre-existing baseline PRs!
+   * Explicitly allowed to backfill pre-existing baseline PRs AND resume incomplete
+   * groups (e.g. unverified kickoff or unset top notice) without creating a duplicate group!
    */
   async openPr(opts: {
     repo: string;
@@ -1059,23 +1514,24 @@ export class GitHubWatcher {
       await this.persistRateLimits();
 
       const prKey = makePrKey(rule.repo, pr.number);
+      const repoKey = normalizeRepoKey(rule.repo);
       const existing = state.prGroups[prKey];
       const groupName = renderSafeGroupName(rule.groupNameTemplate, pr);
 
-      if (existing?.status === 'active' && existing.chatId) {
+      if (isPrGroupComplete(existing, rule)) {
         return {
           ok: true,
           dryRun,
           repo: rule.repo,
           prNumber: pr.number,
           action: 'already_active',
-          chatId: existing.chatId,
-          shareLink: existing.shareLink ?? null,
-          kickoffMessageId: existing.kickoffMessageId ?? null,
-          kickoffVerified: existing.kickoffVerified,
-          topNoticeSet: existing.topNoticeSet,
-          shareLinkPosted: existing.shareLinkPosted,
-          groupName: existing.groupName,
+          chatId: existing!.chatId,
+          shareLink: existing!.shareLink ?? null,
+          kickoffMessageId: existing!.kickoffMessageId ?? null,
+          kickoffVerified: existing!.kickoffVerified,
+          topNoticeSet: existing!.topNoticeSet,
+          shareLinkPosted: existing!.shareLinkPosted,
+          groupName: existing!.groupName,
         };
       }
 
@@ -1085,7 +1541,7 @@ export class GitHubWatcher {
           dryRun: true,
           repo: rule.repo,
           prNumber: pr.number,
-          action: existing?.status === 'creating' ? 'would_resume' : 'would_create',
+          action: existing ? 'would_resume' : 'would_create',
           ...(existing?.chatId ? { chatId: existing.chatId } : {}),
           groupName,
           kickoffPreview: buildKickoffPrompt(rule.kickoffPromptTemplate, pr),
@@ -1098,12 +1554,30 @@ export class GitHubWatcher {
           pr,
           githubClient: github,
         });
+        const finalGen = orchestrated.record.lifecycleGeneration ?? 1;
         await this.stateStore.markEventProcessed(
           rule.repo,
           pr.number,
           pr.headSha,
           'manual_open',
+          finalGen,
         );
+        // Sync knownPrs & invalidate repo ETag so subsequent polls do not get a stale 304
+        // or spuriously re-trigger reopen on a reactivated PR!
+        await this.stateStore.update(s => {
+          const r = s.repos[repoKey] ?? { knownPrs: {} };
+          r.knownPrs[String(pr.number)] = {
+            headSha: pr.headSha,
+            draft: pr.draft,
+            state: pr.state,
+            updatedAt: pr.updatedAt || new Date(this.now()).toISOString(),
+          };
+          delete r.etag;
+          delete r.etagKey;
+          s.repos[repoKey] = r;
+        });
+        this.githubClient?.clearEtagCache();
+
         return {
           ok: true,
           dryRun: false,

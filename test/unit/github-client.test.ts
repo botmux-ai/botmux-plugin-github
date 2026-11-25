@@ -624,7 +624,12 @@ describe('GitHubClient (ETag 304, auth modes, fail-closed proxy, SSRF & redirect
           res.end(JSON.stringify({ message: 'Transient error' }));
           return;
         }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        if (req.headers['if-none-match'] === '"etag-p2"') {
+          res.writeHead(304, { ETag: '"etag-p2"' });
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"etag-p2"' });
         res.end('[]');
       },
       async baseUrl => {

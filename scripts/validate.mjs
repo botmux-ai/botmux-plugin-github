@@ -93,7 +93,11 @@ function validateDistLayout() {
 
   const webhooksJson = JSON.parse(readFileSync(join(distDir, 'webhooks', 'index.json'), 'utf8'));
   assert.equal(webhooksJson.schemaVersion, 1);
-  assert.equal(webhooksJson.endpoint, '/webhooks/github');
+  assert.equal(webhooksJson.maxBodyBytes, 1048576);
+  assert.ok(Array.isArray(webhooksJson.routes) && webhooksJson.routes.length === 1);
+  assert.equal(webhooksJson.routes[0].path, '/events');
+  assert.equal(webhooksJson.routes[0].endpoint, '/webhooks/github');
+  assert.equal(webhooksJson.routes[0].maxBodyBytes, 1048576);
 }
 
 function validateMarketEntry() {

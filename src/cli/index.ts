@@ -129,7 +129,14 @@ async function callRunningService(opts: {
       return { kind: 'http_error', status: res.status, port, json };
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException)?.code;
-      if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'EHOSTUNREACH') {
+      // CRITICAL: For mutating POST calls, ONLY ECONNREFUSED/EHOSTUNREACH means the
+      // service was unreachable; ECONNRESET after connecting means unknown outcome and
+      // MUST NOT fall back to spawning a second in-process watcher!
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'EHOSTUNREACH' ||
+        (opts.method === 'GET' && code === 'ECONNRESET')
+      ) {
         continue;
       }
       return {
@@ -296,6 +303,12 @@ const commands = {
     description: 'Trigger an immediate GitHub PR poll/sync [--repo owner/repo] [--dry-run] [--json].',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
       const { flags } = parseFlags(ctx?.args ?? []);
+      if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
+        const msg = 'Missing value for --repo (expected owner/repo)';
+        if (flags.json === true) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+        else console.error(msg);
+        return 1;
+      }
       const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
       const dryRun = flags['dry-run'] === true;
       const asJson = flags.json === true;
@@ -321,22 +334,22 @@ const commands = {
           timeoutMs: 30_000,
         });
 
-        if (live.kind === 'ok' && live.json && typeof live.json === 'object') {
+        if (live.kind === 'unreachable') {
+          const watcher = await createInProcessWatcher(pluginHome, config, registry);
+          result = await watcher.sync({ repo, dryRun });
+        } else if (live.kind === 'ok' && live.json && typeof live.json === 'object') {
           result = live.json as SyncResult;
-        } else if (live.kind === 'timeout' || live.kind === 'http_error') {
+        } else {
           const msg =
             live.kind === 'timeout'
               ? `Live service timed out during sync: ${live.error}`
-              : `Live service returned HTTP ${live.status} during sync`;
+              : `Live service returned invalid response (HTTP ${live.status}) during sync`;
           if (asJson) {
             console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
           } else {
             console.error(`GitHub sync FAILED: ${msg}`);
           }
           return 1;
-        } else {
-          const watcher = await createInProcessWatcher(pluginHome, config, registry);
-          result = await watcher.sync({ repo, dryRun });
         }
 
         if (asJson) {
@@ -416,27 +429,30 @@ const commands = {
           timeoutMs: 45_000,
         });
 
-        if (
-          (live.kind === 'ok' || live.kind === 'http_error') &&
-          live.json &&
-          typeof live.json === 'object'
-        ) {
-          result = live.json as OpenPrResult;
-        } else if (live.kind === 'timeout') {
-          const msg = `Live service timed out during open-pr (${live.error}); check github:status before retrying`;
-          if (asJson) {
-            console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-          } else {
-            console.error(msg);
-          }
-          return 1;
-        } else {
+        if (live.kind === 'unreachable') {
           const watcher = await createInProcessWatcher(pluginHome, config, registry);
           result = await watcher.openPr({
             repo: parsed.repo,
             prNumber: parsed.prNumber,
             dryRun,
           });
+        } else if (
+          (live.kind === 'ok' || live.kind === 'http_error') &&
+          live.json &&
+          typeof live.json === 'object'
+        ) {
+          result = live.json as OpenPrResult;
+        } else {
+          const msg =
+            live.kind === 'timeout'
+              ? `Live service timed out during open-pr (${live.error}); check github:status before retrying`
+              : `Live service returned empty/invalid response (HTTP ${live.status}) during open-pr; check github:status before retrying`;
+          if (asJson) {
+            console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+          } else {
+            console.error(msg);
+          }
+          return 1;
         }
 
         if (asJson) {
@@ -480,8 +496,14 @@ const commands = {
     description: 'Test configured GitHub authentication (PAT, GitHub App, or gh auth token) [--repo owner/repo] [--json].',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
       const { flags } = parseFlags(ctx?.args ?? []);
-      const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
       const asJson = flags.json === true;
+      if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
+        const msg = 'Missing value for --repo (expected owner/repo)';
+        if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+        else console.error(msg);
+        return 1;
+      }
+      const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
       const registry = new SecretRegistry();
 
       try {

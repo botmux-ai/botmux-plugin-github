@@ -19,6 +19,7 @@ import {
   formatSafeError,
 } from '../security/redact.ts';
 import { computeIsFork } from '../security/sanitize.ts';
+import { validateRepoSlug } from '../config/schema.ts';
 import { GitHubAuthManager, type GhCliRunner } from './auth.ts';
 import { RateLimitTracker } from './ratelimit.ts';
 
@@ -254,11 +255,18 @@ export class GitHubClient {
     priority?: 'core' | 'non_core';
     bypassPauseCheck?: boolean;
     timeoutMs?: number;
+    signal?: AbortSignal;
   }): Promise<{
     res: HttpResponseResult;
     method: 'pat' | 'github_app' | 'gh_cli';
     principalFingerprint: string;
   }> {
+    if (opts.signal?.aborted) {
+      const abortErr = new Error('GitHub request aborted');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+
     // Fail closed immediately on invalid proxy config before doing anything.
     if (this.proxyState.kind === 'invalid') {
       throw this.proxyState.error;
@@ -280,10 +288,22 @@ export class GitHubClient {
 
     let refusedToken: string | undefined;
     for (let attempt = 0; attempt < 2; attempt++) {
+      if (opts.signal?.aborted) {
+        const abortErr = new Error('GitHub request aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+
       const resolved = await this.authManager.getToken({
         forceRefresh: attempt > 0,
         refusedToken,
       });
+
+      if (opts.signal?.aborted) {
+        const abortErr = new Error('GitHub request aborted');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
 
       const headers: Record<string, string> = {
         Authorization: `Bearer ${resolved.token}`,
@@ -312,10 +332,11 @@ export class GitHubClient {
           skipIpBlockCheck: this.allowInsecureLocalForTests,
           timeoutMs: opts.timeoutMs ?? 30_000,
           maxResponseBytes: 8 * 1024 * 1024,
+          signal: opts.signal,
           ...(this.testCa ? { ca: this.testCa } : {}),
         });
       } catch (err) {
-        if (err instanceof Error && (err as { code?: string }).code === 'PROXY_CONFIG_INVALID') {
+        if (err instanceof Error && (err.name === 'AbortError' || (err as { code?: string }).code === 'PROXY_CONFIG_INVALID')) {
           throw err;
         }
         throw new Error(formatSafeError(err, this.registry));
@@ -362,8 +383,11 @@ export class GitHubClient {
   }
 
   /**
-   * Lists open pull requests for a repository with ETag / If-None-Match conditional
-   * polling (304 Not Modified consumes zero rate limit quota).
+   * Lists open pull requests for a repository with per-page ETag / If-None-Match
+   * conditional polling (304 Not Modified consumes zero rate limit quota).
+   * When a repository spans >1 page (>100 open PRs), page-1 304 does NOT blindly
+   * skip page 2+: every page is validated with its own conditional ETag so closing
+   * or updating a PR on page 2+ is never masked by an unchanged page 1.
    */
   async listOpenPullRequests(
     owner: string,
@@ -371,9 +395,11 @@ export class GitHubClient {
     opts?: {
       persistedEtag?: string;
       persistedEtagKey?: string;
+      previousPageCount?: number;
       bypassEtag?: boolean;
       maxPages?: number;
       priority?: 'core' | 'non_core';
+      signal?: AbortSignal;
     },
   ): Promise<{
     notModified: boolean;
@@ -381,59 +407,85 @@ export class GitHubClient {
     etag?: string;
     etagKey: string;
     truncated: boolean;
+    pageCount: number;
   }> {
     const repoSlug = `${owner}/${repo}`;
-    const page1Path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=1`;
+    const makePagePath = (page: number) =>
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`;
+    const page1Path = makePagePath(1);
     const maxPages = Math.max(1, Math.min(opts?.maxPages ?? 10, 20));
 
-    // Determine stable cache key for current auth principal so ETag never crosses credentials.
     const tokenInfo = await this.authManager.getToken();
     const etagKey = this.makeEtagKey(tokenInfo.principalFingerprint, page1Path);
 
-    let sendEtag: string | undefined;
-    const cached = this.etagCache.get(etagKey);
-    if (!opts?.bypassEtag) {
-      if (cached) {
-        sendEtag = cached.etag;
+    const cachedPage1 = this.etagCache.get(etagKey);
+    const knownMultiPage =
+      (opts?.previousPageCount !== undefined && opts.previousPageCount > 1) ||
+      Boolean(cachedPage1?.link && hasNextPageLink(cachedPage1.link));
+
+    // If multi-page across cold restart (no cached page-1 body in memory), bypass ETag once
+    // to repopulate full multi-page cache instead of blindly trusting page-1 304.
+    const effectiveBypassEtag =
+      opts?.bypassEtag === true || (knownMultiPage && !cachedPage1);
+
+    let sendPage1Etag: string | undefined;
+    if (!effectiveBypassEtag) {
+      if (cachedPage1) {
+        sendPage1Etag = cachedPage1.etag;
       } else if (
         opts?.persistedEtag &&
         opts.persistedEtagKey === etagKey &&
         VALID_ETAG_RE.test(opts.persistedEtag)
       ) {
-        sendEtag = opts.persistedEtag;
+        sendPage1Etag = opts.persistedEtag;
       }
     }
 
-    const { res } = await this.request({
+    const page1Resp = await this.request({
       method: 'GET',
       path: page1Path,
-      etag: sendEtag,
+      etag: sendPage1Etag,
       resource: 'core',
       priority: opts?.priority ?? 'core',
+      signal: opts?.signal,
     });
 
-    if (res.status === 304) {
-      const rotatedEtag = headerFirst(res.headers, 'etag');
-      const effectiveEtag =
-        rotatedEtag && VALID_ETAG_RE.test(rotatedEtag) ? rotatedEtag : sendEtag;
-      if (cached && effectiveEtag) {
-        cached.etag = effectiveEtag;
-        cached.usedAt = this.now();
+    let anyPageModified = page1Resp.res.status !== 304;
+    let page1Etag: string | undefined;
+    let page1RawText: string;
+    let page1Link: string;
+
+    if (page1Resp.res.status === 304) {
+      const rotated = headerFirst(page1Resp.res.headers, 'etag');
+      page1Etag = rotated && VALID_ETAG_RE.test(rotated) ? rotated : sendPage1Etag;
+
+      // Fast path: single-page repository returned 304 -> zero extra requests!
+      if (!knownMultiPage) {
+        if (cachedPage1 && page1Etag) {
+          cachedPage1.etag = page1Etag;
+          cachedPage1.usedAt = this.now();
+        }
+        return {
+          notModified: true,
+          pulls: [],
+          etag: page1Etag,
+          etagKey,
+          truncated: false,
+          pageCount: 1,
+        };
       }
-      return {
-        notModified: true,
-        pulls: [],
-        etag: effectiveEtag,
-        etagKey,
-        truncated: false,
-      };
+
+      // Multi-page repo: reconstruct page 1 from in-memory cache and validate page 2+
+      page1RawText = cachedPage1!.body;
+      page1Link = headerFirst(page1Resp.res.headers, 'link') || cachedPage1!.link || '';
+    } else {
+      const respEtag = headerFirst(page1Resp.res.headers, 'etag');
+      page1Etag = respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined;
+      page1RawText = page1Resp.res.body.toString('utf8');
+      page1Link = headerFirst(page1Resp.res.headers, 'link');
     }
 
-    const rawText = res.body.toString('utf8');
-    const respEtag = headerFirst(res.headers, 'etag');
-    const linkHeader = headerFirst(res.headers, 'link');
-
-    const page1Items = JSON.parse(rawText) as RawGitHubPr[];
+    const page1Items = JSON.parse(page1RawText) as RawGitHubPr[];
     if (!Array.isArray(page1Items)) {
       throw new Error(`Unexpected non-array response listing PRs for ${repoSlug}`);
     }
@@ -451,48 +503,106 @@ export class GitHubClient {
     };
     appendItems(page1Items);
 
+    const pendingCacheWrites: Array<{ key: string; entry: ETagEntry | null }> = [
+      {
+        key: etagKey,
+        entry: page1Etag
+          ? { etag: page1Etag, body: page1RawText, link: page1Link, usedAt: this.now() }
+          : null,
+      },
+    ];
+
     let truncated = false;
-    let hasMore = page1Items.length === 100 && (linkHeader === '' || hasNextPageLink(linkHeader));
+    let pageCount = 1;
+    let hasMore =
+      (page1Items.length === 100 && (page1Link === '' || hasNextPageLink(page1Link))) ||
+      (knownMultiPage && page1Items.length === 100);
 
     for (let page = 2; hasMore && page <= maxPages; page++) {
-      const pagePath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&sort=updated&direction=desc&per_page=100&page=${page}`;
+      const pagePath = makePagePath(page);
+      const pageCacheKey = this.makeEtagKey(tokenInfo.principalFingerprint, pagePath);
+      const cachedPage = this.etagCache.get(pageCacheKey);
+      const sendPageEtag = !effectiveBypassEtag && cachedPage ? cachedPage.etag : undefined;
+
       const nextResp = await this.request({
         method: 'GET',
         path: pagePath,
+        etag: sendPageEtag,
         resource: 'core',
         priority: opts?.priority ?? 'core',
+        signal: opts?.signal,
       });
-      const items = JSON.parse(nextResp.res.body.toString('utf8')) as RawGitHubPr[];
+
+      pageCount = page;
+      let pageRawText: string;
+      let pageLink: string;
+      let pageEtag: string | undefined;
+
+      if (nextResp.res.status === 304 && cachedPage) {
+        const rotated = headerFirst(nextResp.res.headers, 'etag');
+        pageEtag = rotated && VALID_ETAG_RE.test(rotated) ? rotated : cachedPage.etag;
+        pageRawText = cachedPage.body;
+        const freshLink = headerFirst(nextResp.res.headers, 'link');
+        // If Link header changed from having rel="next" to omitting rel="next", trailing page(s) vanished!
+        if (cachedPage.link && hasNextPageLink(cachedPage.link) && freshLink && !hasNextPageLink(freshLink)) {
+          anyPageModified = true;
+        }
+        pageLink = freshLink || cachedPage.link || '';
+      } else {
+        anyPageModified = true;
+        const respEtag = headerFirst(nextResp.res.headers, 'etag');
+        pageEtag = respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined;
+        pageRawText = nextResp.res.body.toString('utf8');
+        pageLink = headerFirst(nextResp.res.headers, 'link');
+      }
+
+      pendingCacheWrites.push({
+        key: pageCacheKey,
+        entry: pageEtag
+          ? { etag: pageEtag, body: pageRawText, link: pageLink, usedAt: this.now() }
+          : null,
+      });
+
+      const items = JSON.parse(pageRawText) as RawGitHubPr[];
       if (!Array.isArray(items) || items.length === 0) break;
       appendItems(items);
-      const nextLink = headerFirst(nextResp.res.headers, 'link');
-      hasMore = items.length === 100 && (nextLink === '' || hasNextPageLink(nextLink));
+      hasMore =
+        (items.length === 100 && (pageLink === '' || hasNextPageLink(pageLink))) ||
+        (opts?.previousPageCount !== undefined && page < opts.previousPageCount);
       if (page === maxPages && hasMore) {
         truncated = true;
       }
     }
 
-    // Only update in-memory ETag cache AFTER all pagination pages succeed (prevents poisoning on page 2+ errors).
+    // Only commit per-page ETags AFTER all pages succeed (prevents poisoning on page 2+ errors).
     if (!opts?.bypassEtag) {
-      if (respEtag && VALID_ETAG_RE.test(respEtag)) {
-        this.putEtagEntry(etagKey, {
-          etag: respEtag,
-          body: rawText,
-          link: linkHeader,
-          usedAt: this.now(),
-        });
-      } else {
-        // Untagged 200 invalidates stale ETag cache entry.
-        this.etagCache.delete(etagKey);
+      for (const write of pendingCacheWrites) {
+        if (write.entry) {
+          this.putEtagEntry(write.key, write.entry);
+        } else {
+          this.etagCache.delete(write.key);
+        }
       }
+    }
+
+    if (!anyPageModified) {
+      return {
+        notModified: true,
+        pulls: [],
+        etag: page1Etag,
+        etagKey,
+        truncated: false,
+        pageCount,
+      };
     }
 
     return {
       notModified: false,
       pulls: allPulls,
-      etag: respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined,
+      etag: page1Etag,
       etagKey,
       truncated,
+      pageCount,
     };
   }
 
@@ -500,7 +610,7 @@ export class GitHubClient {
     owner: string,
     repo: string,
     prNumber: number,
-    opts?: { priority?: 'core' | 'non_core'; bypassPauseCheck?: boolean },
+    opts?: { priority?: 'core' | 'non_core'; bypassPauseCheck?: boolean; signal?: AbortSignal },
   ): Promise<PullRequestInfo> {
     const repoSlug = `${owner}/${repo}`;
     const { res } = await this.request({
@@ -509,6 +619,7 @@ export class GitHubClient {
       resource: 'core',
       priority: opts?.priority ?? 'core',
       bypassPauseCheck: opts?.bypassPauseCheck,
+      signal: opts?.signal,
     });
     const raw = JSON.parse(res.body.toString('utf8')) as RawGitHubPr;
     const pr = parsePrObject(repoSlug, raw);
@@ -623,19 +734,20 @@ export class GitHubClient {
       }
 
       let repoAccess: AuthTestResult['repoAccess'];
-      if (opts?.repo && opts.repo.includes('/')) {
-        const [owner, repo] = opts.repo.split('/');
+      if (opts?.repo !== undefined && opts.repo.trim() !== '') {
         try {
+          const validSlug = validateRepoSlug(opts.repo);
+          const [owner, repo] = validSlug.split('/');
           await this.request({
             method: 'GET',
             path: `/repos/${encodeURIComponent(owner!)}/${encodeURIComponent(repo!)}`,
             bypassPauseCheck: true,
             timeoutMs,
           });
-          repoAccess = { repo: opts.repo, ok: true };
+          repoAccess = { repo: validSlug, ok: true };
         } catch (err) {
           repoAccess = {
-            repo: opts.repo,
+            repo: opts.repo.trim(),
             ok: false,
             error: formatSafeError(err, this.registry),
           };
@@ -643,8 +755,9 @@ export class GitHubClient {
       }
 
       const snap = this.rateLimits.snapshot();
+      const topOk = repoAccess ? repoAccess.ok : true;
       return {
-        ok: true,
+        ok: topOk,
         authMode: this.authConfig.mode,
         resolvedMethod: resolved.method,
         apiBaseUrl: this.authConfig.apiBaseUrl.toString(),
@@ -652,6 +765,11 @@ export class GitHubClient {
         ...(scopes ? { scopes } : {}),
         ...(snap.core ? { rateLimit: snap.core } : {}),
         ...(repoAccess ? { repoAccess } : {}),
+        ...(!topOk
+          ? {
+              error: `Repository access check failed for ${repoAccess!.repo}: ${repoAccess!.error ?? 'forbidden'}`,
+            }
+          : {}),
       };
     } catch (err) {
       return {
