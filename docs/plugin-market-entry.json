@@ -1,0 +1,17 @@
+{
+  "id": "github",
+  "package": "@botmux-ai/plugin-github",
+  "displayName": "GitHub",
+  "description": "Monitor GitHub pull requests with ETag conditional polling and optional loopback webhooks, and automatically create crash-safe Botmux review groups with anti-injection metadata isolation.",
+  "repo": "https://github.com/botmux-ai/botmux-plugin-github",
+  "docs": "https://github.com/botmux-ai/botmux-plugin-github#readme",
+  "categories": [
+    "automation",
+    "code-review",
+    "developer-tools",
+    "github"
+  ],
+  "compatibility": {
+    "botmux": ">=3.59.0"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "name": "@botmux-ai/plugin-github",
+  "version": "0.1.0",
+  "description": "Official Botmux plugin for GitHub PR event monitoring and automated review group creation.",
+  "type": "module",
+  "keywords": [
+    "botmux-plugin",
+    "botmux",
+    "github",
+    "pull-request",
+    "code-review",
+    "feishu",
+    "lark"
+  ],
+  "homepage": "https://github.com/botmux-ai/botmux-plugin-github#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botmux-ai/botmux-plugin-github.git"
+  },
+  "bugs": {
+    "url": "https://github.com/botmux-ai/botmux-plugin-github/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "dist/"
+  ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "botmux": {
+    "schemaVersion": 1,
+    "id": "github",
+    "displayName": "GitHub",
+    "description": "Monitor GitHub pull requests via ETag polling and optional loopback webhooks, and automatically create crash-safe Botmux review groups.",
+    "service": {
+      "mode": "auto"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "node ./scripts/build.mjs",
+    "validate": "node ./scripts/validate.mjs",
+    "test:unit": "node --test test/unit/*.test.ts",
+    "test:integration": "node --test test/integration/*.test.ts",
+    "test": "npm run typecheck && npm run build && npm run validate && npm run test:unit && npm run test:integration",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "esbuild": "^0.25.5",
+    "typescript": "^5.8.3"
+  }
+}
