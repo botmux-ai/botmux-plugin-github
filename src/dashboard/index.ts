@@ -763,13 +763,22 @@ export default function GitHubPluginDashboard(props: {
     async (dryRun: boolean) => {
       const spec = openPrInput.trim();
       const idx = spec.lastIndexOf('#');
-      if (idx <= 0 || !spec.slice(0, idx).includes('/')) {
+      if (idx <= 0) {
         setNotice({ kind: 'err', text: 'Enter PR as owner/repo#123.' });
         return;
       }
       const repo = spec.slice(0, idx).trim();
-      const prNumber = Number.parseInt(spec.slice(idx + 1).trim(), 10);
-      if (!Number.isInteger(prNumber) || prNumber < 1) {
+      const numRaw = spec.slice(idx + 1).trim();
+      if (!/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})\/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})$/.test(repo)) {
+        setNotice({ kind: 'err', text: 'Repository must be in valid owner/repo format.' });
+        return;
+      }
+      if (!/^\d+$/.test(numRaw)) {
+        setNotice({ kind: 'err', text: 'PR number must be a positive integer (e.g. owner/repo#123).' });
+        return;
+      }
+      const prNumber = Number(numRaw);
+      if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
         setNotice({ kind: 'err', text: 'PR number must be a positive integer.' });
         return;
       }

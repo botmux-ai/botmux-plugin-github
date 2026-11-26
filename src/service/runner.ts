@@ -16,7 +16,7 @@ import {
   loadPluginConfig,
   resolvePluginHome,
 } from '../config/store.ts';
-import { redactConfig } from '../config/schema.ts';
+import { redactConfig, validateRepoSlug } from '../config/schema.ts';
 import { StateStore } from '../state/store.ts';
 import { GitHubWatcher } from '../engine/watcher.ts';
 import type { GhCliRunner } from '../github/auth.ts';
@@ -451,10 +451,17 @@ export async function startGitHubService(
               })
             : {};
         if (body.async === true && body.dryRun !== true) {
-          const repo = String(body.repo ?? '').trim();
+          const rawRepo = String(body.repo ?? '').trim();
           const prNumber = Number(body.prNumber ?? 0);
-          if (!repo.includes('/') || !Number.isInteger(prNumber) || prNumber < 1) {
-            sendJson(res, 400, { ok: false, error: 'Invalid repo or prNumber' });
+          let repo: string;
+          try {
+            repo = validateRepoSlug(rawRepo);
+          } catch {
+            sendJson(res, 400, { ok: false, error: 'Invalid repo slug' });
+            return;
+          }
+          if (!Number.isSafeInteger(prNumber) || prNumber < 1) {
+            sendJson(res, 400, { ok: false, error: 'Invalid prNumber' });
             return;
           }
           void watcher.openPr({ repo, prNumber, dryRun: false });

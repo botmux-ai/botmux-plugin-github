@@ -7,16 +7,17 @@ import type {
 import {
   apiOriginChanged,
   applyConfigPatch,
+  createDefaultConfig,
   normalizeAndValidateConfig,
   redactConfig,
   registerConfigSecrets,
 } from '../config/schema.ts';
 import {
-  loadPluginConfig,
   readControlTokenIfExists,
   resolvePluginHome,
 } from '../config/store.ts';
-import { StateStore } from '../state/store.ts';
+import { readSecureFileIfExists } from '../security/fs.ts';
+import { StateStore, StateCorruptError, createEmptyState } from '../state/store.ts';
 import { GitHubClient } from '../github/client.ts';
 import { GitHubWatcher } from '../engine/watcher.ts';
 import { loopbackRequest } from '../security/net.ts';
@@ -47,9 +48,53 @@ function getAllowInsecureTestFlag(): boolean {
   return process.env.BOTMUX_GITHUB_ALLOW_INSECURE_TEST_API === '1';
 }
 
-function loadConfigFromApi(api: SettingsApi, allowInsecure: boolean): PluginConfig {
-  const raw = api.config.get();
-  return normalizeAndValidateConfig(raw, { allowInsecureLocalApiForTests: allowInsecure });
+/**
+ * Strictly loads existing config from Botmux's config API (or disk if present):
+ * - Returns default config ONLY when no config exists yet (empty {} and ENOENT on disk).
+ * - Throws immediately if an existing config fails JSON parse or schema validation
+ *   so saveSettings NEVER wipes stored PATs, keys, or repository rules with defaults!
+ */
+async function loadExistingConfigStrict(
+  api: SettingsApi,
+  allowInsecure: boolean,
+): Promise<PluginConfig> {
+  // Always verify on-disk config.json is not a symlink or non-regular file when path exists
+  let onDiskBuf: Buffer | null = null;
+  if (api.config.path) {
+    onDiskBuf = await readSecureFileIfExists(api.config.path, {
+      maxBytes: 1024 * 1024,
+      rejectHardlinks: false,
+    });
+  }
+
+  const rawFromApi = api.config.get();
+  if (rawFromApi !== undefined) {
+    if (!rawFromApi || typeof rawFromApi !== 'object' || Array.isArray(rawFromApi)) {
+      throw new Error('Existing configuration must be a JSON object');
+    }
+    if (Object.keys(rawFromApi as Record<string, unknown>).length > 0) {
+      return normalizeAndValidateConfig(rawFromApi, {
+        allowInsecureLocalApiForTests: allowInsecure,
+      });
+    }
+  }
+
+  // If api.config.get() returned empty/undefined, verify whether config.json actually exists on disk!
+  if (onDiskBuf !== null) {
+    const trimmed = onDiskBuf.toString('utf8').trim();
+    if (trimmed.length === 0) {
+      throw new Error(`Existing config file at ${api.config.path} is empty/corrupt`);
+    }
+    const parsed: unknown = JSON.parse(trimmed);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`Existing config file at ${api.config.path} must be a JSON object`);
+    }
+    return normalizeAndValidateConfig(parsed, {
+      allowInsecureLocalApiForTests: allowInsecure,
+    });
+  }
+
+  return createDefaultConfig();
 }
 
 function resolveCandidatePorts(boundPort: number | undefined, configPort: number): number[] {
@@ -139,7 +184,10 @@ async function callLocalService(opts: {
  * Strictly returns browser-safe redacted settings + live runtime health/mappings.
  */
 export async function getSettings(api: SettingsApi): Promise<{
-  ok: true;
+  ok: boolean;
+  error?: string;
+  configCorrupt?: boolean;
+  stateCorrupt?: boolean;
   config: RedactedPluginConfig;
   service: {
     online: boolean;
@@ -169,19 +217,23 @@ export async function getSettings(api: SettingsApi): Promise<{
   const registry = new SecretRegistry();
 
   let config: PluginConfig;
+  let configError: string | undefined;
   try {
-    config = loadConfigFromApi(api, allowInsecure);
-  } catch {
-    config = await loadPluginConfig(pluginHome, {
-      allowInsecureLocalApiForTests: allowInsecure,
-    }).catch(() => normalizeAndValidateConfig({}, { allowInsecureLocalApiForTests: allowInsecure }));
+    config = await loadExistingConfigStrict(api, allowInsecure);
+  } catch (err) {
+    configError = formatSafeError(err, registry);
+    config = createDefaultConfig();
   }
   registerConfigSecrets(config, registry);
 
   const stateStore = new StateStore(pluginHome, registry);
+  let stateError: string | undefined;
   const [state, recentEvents, bots, onlineDaemons] = await Promise.all([
-    stateStore.load(),
-    stateStore.readRecentEvents(40),
+    stateStore.load().catch(err => {
+      stateError = formatSafeError(err, registry);
+      return createEmptyState();
+    }),
+    stateStore.readRecentEvents(40).catch(() => []),
     loadBotsConfig(undefined, registry).catch(() => []),
     discoverOnlineDaemons().catch(() => new Map()),
   ]);
@@ -214,8 +266,13 @@ export async function getSettings(api: SettingsApi): Promise<{
         ? live.port
         : config.service.port;
 
+  const combinedErr = [configError, stateError].filter(Boolean).join('; ');
+
   return {
-    ok: true,
+    ok: !configError && !stateError,
+    ...(combinedErr ? { error: combinedErr } : {}),
+    ...(configError ? { configCorrupt: true } : {}),
+    ...(stateError ? { stateCorrupt: true } : {}),
     config: redactConfig(config),
     service: {
       online: Boolean(liveJson),
@@ -246,9 +303,9 @@ export async function getSettings(api: SettingsApi): Promise<{
 /**
  * Named export required by Botmux Dashboard PUT /api/plugins/github/settings.
  * Executes inside Botmux's 30s withPluginServiceLock:
+ * - Strictly fails closed if existing config.json is invalid/corrupt (NEVER wipes PAT or rules with defaults!)
  * - Strictly fast, bounded timeouts, NEVER calls plugin lifecycle start/stop/restart
  * - Never throws unhandled errors (always returns structured `{ ok: false, error }`)
- * - Never spawns a concurrent in-process watcher on live-service timeout
  */
 export async function saveSettings(
   api: SettingsApi,
@@ -268,17 +325,23 @@ export async function saveSettings(
     const payload = value as Record<string, unknown>;
     const action = typeof payload.action === 'string' ? payload.action : 'saveConfig';
 
-    let current: PluginConfig;
-    try {
-      current = loadConfigFromApi(api, allowInsecure);
-    } catch {
-      current = normalizeAndValidateConfig({}, { allowInsecureLocalApiForTests: allowInsecure });
-    }
+    // CRITICAL: Fail closed if existing config is corrupt/invalid — NEVER substitute empty defaults!
+    const current = await loadExistingConfigStrict(api, allowInsecure);
     registerConfigSecrets(current, registry);
 
     const stateStore = new StateStore(pluginHome, registry);
-    const state = await stateStore.load();
-    const candidatePorts = resolveCandidatePorts(state.service.boundPort, current.service.port);
+    let boundPort: number | undefined;
+    try {
+      const state = await stateStore.load();
+      boundPort = state.service.boundPort;
+    } catch (err) {
+      if (!(err instanceof StateCorruptError)) throw err;
+      // Allow saving config even if state.json needs manual repair, while non-config actions fail closed
+      if (action !== 'saveConfig') {
+        return { ok: false, error: formatSafeError(err, registry) };
+      }
+    }
+    const candidatePorts = resolveCandidatePorts(boundPort, current.service.port);
 
     if (action === 'testAuth') {
       const repo = typeof payload.repo === 'string' ? payload.repo.trim() : undefined;
@@ -443,11 +506,11 @@ export async function saveSettings(
       timeoutMs: 1_500,
     });
 
-    const boundPort = reloadResp.kind === 'ok' ? reloadResp.port : state.service.boundPort;
+    const effectiveBoundPort = reloadResp.kind === 'ok' ? reloadResp.port : boundPort;
     return {
       ok: true,
       reloaded: reloadResp.kind === 'ok',
-      portRestartRequired: Boolean(boundPort && boundPort !== next.service.port),
+      portRestartRequired: Boolean(effectiveBoundPort && effectiveBoundPort !== next.service.port),
       config: redactConfig(next),
     };
   } catch (err) {

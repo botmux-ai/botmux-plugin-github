@@ -22,6 +22,16 @@ const MAX_PROCESSED_DELIVERIES = 5_000;
 const DELIVERY_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
 const MAX_EVENT_LOG_BYTES = 5 * 1024 * 1024; // 5 MiB
 
+export class StateCorruptError extends Error {
+  readonly code = 'STATE_CORRUPT';
+  readonly statePath: string;
+  constructor(statePath: string, detail: string) {
+    super(`Corrupt state file at ${statePath}: ${detail} (refusing to overwrite)`);
+    this.name = 'StateCorruptError';
+    this.statePath = statePath;
+  }
+}
+
 export function createEmptyState(): PluginState {
   return {
     schemaVersion: 1,
@@ -84,23 +94,46 @@ function toSafeStringRecord(raw: unknown): Record<string, string> {
   return out;
 }
 
-function normalizeState(raw: unknown): PluginState {
+function assertStateMapField(
+  statePath: string,
+  val: unknown,
+  fieldName: string,
+): Record<string, unknown> | undefined {
+  if (val === undefined) return undefined;
+  if (!val || typeof val !== 'object' || Array.isArray(val)) {
+    throw new StateCorruptError(statePath, `field "${fieldName}" must be a JSON object`);
+  }
+  return val as Record<string, unknown>;
+}
+
+function normalizeState(raw: unknown, statePath: string): PluginState {
   const base = createEmptyState();
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new StateCorruptError(statePath, 'root JSON value must be an object');
+  }
   const obj = raw as Record<string, unknown>;
-  if (obj.repos && typeof obj.repos === 'object' && !Array.isArray(obj.repos)) {
-    base.repos = obj.repos as Record<string, RepoRuntimeState>;
-  }
-  if (obj.prGroups && typeof obj.prGroups === 'object' && !Array.isArray(obj.prGroups)) {
-    base.prGroups = obj.prGroups as Record<string, PrGroupRecord>;
-  }
-  base.processedEvents = toSafeStringRecord(obj.processedEvents);
-  base.processedDeliveries = toSafeStringRecord(obj.processedDeliveries);
-  if (obj.rateLimits && typeof obj.rateLimits === 'object' && !Array.isArray(obj.rateLimits)) {
-    base.rateLimits = obj.rateLimits as RateLimitState;
-  }
-  if (obj.service && typeof obj.service === 'object' && !Array.isArray(obj.service)) {
-    const svc = obj.service as Partial<PluginState['service']>;
+  const repos = assertStateMapField(statePath, obj.repos, 'repos');
+  if (repos) base.repos = repos as Record<string, RepoRuntimeState>;
+
+  const prGroups = assertStateMapField(statePath, obj.prGroups, 'prGroups');
+  if (prGroups) base.prGroups = prGroups as Record<string, PrGroupRecord>;
+
+  const processedEvents = assertStateMapField(statePath, obj.processedEvents, 'processedEvents');
+  base.processedEvents = toSafeStringRecord(processedEvents);
+
+  const processedDeliveries = assertStateMapField(
+    statePath,
+    obj.processedDeliveries,
+    'processedDeliveries',
+  );
+  base.processedDeliveries = toSafeStringRecord(processedDeliveries);
+
+  const rateLimits = assertStateMapField(statePath, obj.rateLimits, 'rateLimits');
+  if (rateLimits) base.rateLimits = rateLimits as RateLimitState;
+
+  const svcObj = assertStateMapField(statePath, obj.service, 'service');
+  if (svcObj) {
+    const svc = svcObj as Partial<PluginState['service']>;
     base.service = {
       mode: svc.mode === 'active' || svc.mode === 'paused' ? svc.mode : 'dormant',
       activeRepoCount: typeof svc.activeRepoCount === 'number' ? svc.activeRepoCount : 0,
@@ -143,17 +176,31 @@ export class StateStore {
     return run;
   }
 
+  /**
+   * Loads state.json strictly:
+   * - Returns empty state ONLY when state.json does not exist (ENOENT).
+   * - Fails closed with StateCorruptError when state.json exists but is malformed
+   *   or non-object JSON, so existing dedup/group mappings are NEVER silently wiped!
+   */
   async load(): Promise<PluginState> {
     const buf = await readSecureFileIfExists(this.statePath, {
       maxBytes: MAX_STATE_BYTES,
       requireMode0600: true,
     });
     if (!buf) return createEmptyState();
+    let parsed: unknown;
     try {
-      return normalizeState(JSON.parse(buf.toString('utf8')));
-    } catch {
-      return createEmptyState();
+      parsed = JSON.parse(buf.toString('utf8'));
+    } catch (err) {
+      throw new StateCorruptError(
+        this.statePath,
+        err instanceof Error ? err.message : 'invalid JSON',
+      );
     }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new StateCorruptError(this.statePath, 'root JSON value must be an object');
+    }
+    return normalizeState(parsed, this.statePath);
   }
 
   /**

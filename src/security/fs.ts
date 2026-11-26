@@ -30,6 +30,9 @@ export interface SafeReadOptions {
 
 export interface FileLockHandle {
   readonly lockPath: string;
+  readonly nonce: string;
+  verifyOwned(): Promise<boolean>;
+  renew(): Promise<boolean>;
   release(): Promise<void>;
 }
 
@@ -311,6 +314,7 @@ export async function writeSecureFileAtomic(
 interface LockPayload {
   pid: number;
   startedAt: number;
+  heartbeatAt?: number;
   nonce: string;
 }
 
@@ -359,7 +363,12 @@ async function readLockPayload(
       typeof parsed.nonce === 'string'
     ) {
       return {
-        payload: { pid: parsed.pid, startedAt: parsed.startedAt, nonce: parsed.nonce },
+        payload: {
+          pid: parsed.pid,
+          startedAt: parsed.startedAt,
+          ...(typeof parsed.heartbeatAt === 'number' ? { heartbeatAt: parsed.heartbeatAt } : {}),
+          nonce: parsed.nonce,
+        },
         mtimeMs: st.mtimeMs,
       };
     }
@@ -382,27 +391,43 @@ async function readLockPayload(
 
 /**
  * Acquires an exclusive nonce-tagged lockfile using O_CREAT|O_EXCL|O_NOFOLLOW
- * with stale PID / timeout recovery and nonce-verified release.
+ * with liveness-checked stale recovery, periodic heartbeat lease renewal, and
+ * nonce-verified fencing + release.
+ *
+ * CRITICAL INVARIANT: A lock owned by a LIVE PID (`isPidAlive(pid) === true`)
+ * is NEVER stolen solely due to elapsed wall-clock age (`staleMs`)! Only dead
+ * PIDs or empty/corrupt lockfiles older than `staleMs` may be reclaimed.
  */
 export async function acquireSecureLock(
   lockPath: string,
-  opts?: { timeoutMs?: number; staleMs?: number; pollMs?: number },
+  opts?: {
+    timeoutMs?: number;
+    staleMs?: number;
+    pollMs?: number;
+    heartbeatIntervalMs?: number;
+    now?: () => number;
+  },
 ): Promise<FileLockHandle> {
   assertCleanPath(lockPath);
   const abs = resolve(lockPath);
   const dir = dirname(abs);
   await ensureSecureDir(dir);
 
+  const now = opts?.now ?? (() => Date.now());
   const timeoutMs = opts?.timeoutMs ?? 10_000;
   const staleMs = opts?.staleMs ?? 30_000;
   const pollMs = opts?.pollMs ?? 25;
+  const heartbeatIntervalMs = opts?.heartbeatIntervalMs ?? Math.max(1_000, Math.min(15_000, Math.floor(staleMs / 3)));
   const nonce = randomBytes(16).toString('hex');
-  const deadline = Date.now() + timeoutMs;
+  // Use real monotonic wall clock for wait timeout so injectable fake clocks for staleMs tests never hang
+  const waitDeadline = Date.now() + timeoutMs;
 
   while (true) {
+    const acquiredAt = now();
     const payload: LockPayload = {
       pid: process.pid,
-      startedAt: Date.now(),
+      startedAt: acquiredAt,
+      heartbeatAt: acquiredAt,
       nonce,
     };
     let handle: fsp.FileHandle | undefined;
@@ -415,18 +440,85 @@ export async function acquireSecureLock(
       await handle.chmod(0o600);
       await handle.writeFile(JSON.stringify(payload), 'utf8');
       await handle.sync();
-      await handle.close();
-      handle = undefined;
+      const heldStat = await handle.stat();
+      const heldDev = heldStat.dev;
+      const heldIno = heldStat.ino;
 
+      // Keep the exclusive FileHandle open for the lock lifetime and serialize renew/release.
+      // Renew updates the held inode's mtime in-place via handle.utimes() — NEVER via rename() —
+      // so renew() can NEVER resurrect a released lockfile or overwrite a new holder's lock!
+      const lockHandle = handle;
+      handle = undefined;
       let released = false;
+      let inFlightRenew: Promise<boolean> | null = null;
+
+      const verifyPathMatchesHeldInode = async (): Promise<boolean> => {
+        try {
+          const lst = await fsp.lstat(abs);
+          if (lst.isSymbolicLink() || !lst.isFile()) return false;
+          return lst.dev === heldDev && lst.ino === heldIno;
+        } catch {
+          return false;
+        }
+      };
+
+      const verifyOwned = async (): Promise<boolean> => {
+        if (released) return false;
+        if (!(await verifyPathMatchesHeldInode())) return false;
+        const current = await readLockPayload(abs).catch(() => null);
+        return current?.payload?.nonce === nonce && current.payload.pid === process.pid;
+      };
+
+      const renew = async (): Promise<boolean> => {
+        if (released) return false;
+        if (inFlightRenew) return inFlightRenew;
+        inFlightRenew = (async () => {
+          try {
+            if (released) return false;
+            if (!(await verifyPathMatchesHeldInode())) return false;
+            const ts = new Date(now());
+            await lockHandle.utimes(ts, ts);
+            return !released;
+          } catch {
+            return false;
+          } finally {
+            inFlightRenew = null;
+          }
+        })();
+        return inFlightRenew;
+      };
+
+      const hbTimer =
+        heartbeatIntervalMs > 0
+          ? setInterval(() => {
+              if (!released && !inFlightRenew) {
+                void renew();
+              }
+            }, heartbeatIntervalMs)
+          : null;
+      hbTimer?.unref?.();
+
       return {
         lockPath: abs,
+        nonce,
+        verifyOwned,
+        renew,
         async release() {
           if (released) return;
           released = true;
-          const current = await readLockPayload(abs).catch(() => null);
-          if (current?.payload?.nonce === nonce) {
-            await fsp.unlink(abs).catch(() => {});
+          if (hbTimer) clearInterval(hbTimer);
+          if (inFlightRenew) {
+            await inFlightRenew.catch(() => {});
+          }
+          try {
+            if (await verifyPathMatchesHeldInode()) {
+              const current = await readLockPayload(abs).catch(() => null);
+              if (current?.payload?.nonce === nonce) {
+                await fsp.unlink(abs).catch(() => {});
+              }
+            }
+          } finally {
+            await lockHandle.close().catch(() => {});
           }
         },
       };
@@ -443,9 +535,16 @@ export async function acquireSecureLock(
 
       const existing = await readLockPayload(abs);
       if (existing) {
-        const ageMs = Date.now() - (existing.payload?.startedAt ?? existing.mtimeMs);
-        const dead = existing.payload ? !isPidAlive(existing.payload.pid) : ageMs > staleMs;
-        if (dead || ageMs > staleMs) {
+        let canSteal = false;
+        if (existing.payload) {
+          // Only steal when owner PID is provably dead — NEVER steal from a live owner PID!
+          canSteal = !isPidAlive(existing.payload.pid);
+        } else {
+          // Empty/corrupt lockfile (e.g. SIGKILL mid-creation): reclaim after staleMs
+          const ageMs = now() - existing.mtimeMs;
+          canSteal = ageMs > staleMs;
+        }
+        if (canSteal) {
           const again = await readLockPayload(abs);
           if (
             again &&
@@ -458,7 +557,7 @@ export async function acquireSecureLock(
         }
       }
 
-      if (Date.now() >= deadline) {
+      if (Date.now() >= waitDeadline) {
         throw new SecurityFsError('LOCK_TIMEOUT', `Timed out acquiring lock: ${abs}`);
       }
       await new Promise(r => setTimeout(r, pollMs));

@@ -1,7 +1,7 @@
 import { dirname } from 'node:path';
 import type { AuthTestResult, OpenPrResult, PluginConfig, SyncResult } from '../types.ts';
 import { loadPluginConfig, readControlTokenIfExists, resolvePluginHome } from '../config/store.ts';
-import { redactConfig, registerConfigSecrets } from '../config/schema.ts';
+import { redactConfig, registerConfigSecrets, validateRepoSlug } from '../config/schema.ts';
 import { StateStore } from '../state/store.ts';
 import { GitHubWatcher } from '../engine/watcher.ts';
 import { loopbackRequest } from '../security/net.ts';
@@ -28,6 +28,20 @@ type ServiceRpcOutcome =
   | { kind: 'http_error'; status: number; port: number; json: unknown }
   | { kind: 'timeout'; port: number; error: string }
   | { kind: 'unreachable' };
+
+function parseBooleanFlag(
+  flags: Record<string, string | boolean>,
+  name: string,
+): boolean {
+  const raw = flags[name];
+  if (raw === undefined) return false;
+  if (raw === true) return true;
+  if (raw === false) return false;
+  const norm = raw.trim().toLowerCase();
+  if (norm === 'true' || norm === '1') return true;
+  if (norm === 'false' || norm === '0') return false;
+  throw new Error(`Invalid boolean value for --${name}: "${raw}" (expected true or false)`);
+}
 
 function parseFlags(args: string[]): { flags: Record<string, string | boolean>; positional: string[] } {
   const flags: Record<string, string | boolean> = {};
@@ -59,17 +73,42 @@ function parseFlags(args: string[]): { flags: Record<string, string | boolean>; 
   return { flags, positional };
 }
 
+function assertAllowedArgs(
+  flags: Record<string, string | boolean>,
+  positional: string[],
+  opts: { allowedFlags: readonly string[]; maxPositional: number },
+): void {
+  const allowed = new Set(opts.allowedFlags);
+  for (const key of Object.keys(flags)) {
+    if (!allowed.has(key)) {
+      throw new Error(`Unknown option: --${key}`);
+    }
+  }
+  if (positional.length > opts.maxPositional) {
+    throw new Error(`Unexpected argument: "${positional[opts.maxPositional]}"`);
+  }
+  for (const pos of positional) {
+    if (pos.startsWith('-')) {
+      throw new Error(`Unknown option: "${pos}"`);
+    }
+  }
+}
+
 export function parsePrSpec(spec: string): { repo: string; prNumber: number } | null {
   const trimmed = spec.trim();
   const hashIdx = trimmed.lastIndexOf('#');
   if (hashIdx <= 0) return null;
-  const repo = trimmed.slice(0, hashIdx).trim();
+  const repoRaw = trimmed.slice(0, hashIdx).trim();
   const numStr = trimmed.slice(hashIdx + 1).trim();
   if (!/^\d+$/.test(numStr)) return null;
-  const prNumber = Number.parseInt(numStr, 10);
-  if (!Number.isInteger(prNumber) || prNumber < 1) return null;
-  if (!repo.includes('/')) return null;
-  return { repo, prNumber };
+  const prNumber = Number(numStr);
+  if (!Number.isSafeInteger(prNumber) || prNumber < 1) return null;
+  try {
+    const repo = validateRepoSlug(repoRaw);
+    return { repo, prNumber };
+  } catch {
+    return null;
+  }
 }
 
 async function resolveCliHome(ctx?: CliContext, api?: CliApi): Promise<string> {
@@ -236,11 +275,13 @@ const commands = {
   'github:status': {
     description: 'Show GitHub plugin service status, rate limits, repo rules, and PR group mappings.',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
-      const { flags } = parseFlags(ctx?.args ?? []);
-      const asJson = flags.json === true;
+      const { flags, positional } = parseFlags(ctx?.args ?? []);
       const registry = new SecretRegistry();
+      let asJson = false;
 
       try {
+        asJson = parseBooleanFlag(flags, 'json');
+        assertAllowedArgs(flags, positional, { allowedFlags: ['json'], maxPositional: 0 });
         const pluginHome = await resolveCliHome(ctx, api);
         const allowInsecure = process.env.BOTMUX_GITHUB_ALLOW_INSECURE_TEST_API === '1';
         const config = await loadPluginConfig(pluginHome, {
@@ -302,19 +343,22 @@ const commands = {
   'github:sync': {
     description: 'Trigger an immediate GitHub PR poll/sync [--repo owner/repo] [--dry-run] [--json].',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
-      const { flags } = parseFlags(ctx?.args ?? []);
-      if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
-        const msg = 'Missing value for --repo (expected owner/repo)';
-        if (flags.json === true) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-        else console.error(msg);
-        return 1;
-      }
-      const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
-      const dryRun = flags['dry-run'] === true;
-      const asJson = flags.json === true;
+      const { flags, positional } = parseFlags(ctx?.args ?? []);
       const registry = new SecretRegistry();
+      let asJson = false;
 
       try {
+        asJson = parseBooleanFlag(flags, 'json');
+        assertAllowedArgs(flags, positional, { allowedFlags: ['repo', 'dry-run', 'json'], maxPositional: 0 });
+        const dryRun = parseBooleanFlag(flags, 'dry-run');
+        if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
+          const msg = 'Missing value for --repo (expected owner/repo)';
+          if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+          else console.error(msg);
+          return 1;
+        }
+        const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
+
         const pluginHome = await resolveCliHome(ctx, api);
         const allowInsecure = process.env.BOTMUX_GITHUB_ALLOW_INSECURE_TEST_API === '1';
         const config = await loadPluginConfig(pluginHome, {
@@ -394,22 +438,25 @@ const commands = {
     description: 'Explicitly create or resume a Botmux review group for <owner/repo#N> [--dry-run] [--json].',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
       const { flags, positional } = parseFlags(ctx?.args ?? []);
-      const dryRun = flags['dry-run'] === true;
-      const asJson = flags.json === true;
-      const specRaw = positional[0] ?? '';
-      const parsed = parsePrSpec(specRaw);
-      if (!parsed) {
-        const msg = 'Usage: botmux github:open-pr <owner/repo#N> [--dry-run] [--json]';
-        if (asJson) {
-          console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-        } else {
-          console.error(msg);
-        }
-        return 1;
-      }
-
       const registry = new SecretRegistry();
+      let asJson = false;
+      let specRaw = positional[0] ?? '';
+
       try {
+        asJson = parseBooleanFlag(flags, 'json');
+        assertAllowedArgs(flags, positional, { allowedFlags: ['dry-run', 'json'], maxPositional: 1 });
+        const dryRun = parseBooleanFlag(flags, 'dry-run');
+        const parsed = parsePrSpec(specRaw);
+        if (!parsed) {
+          const msg = 'Usage: botmux github:open-pr <owner/repo#N> [--dry-run] [--json]';
+          if (asJson) {
+            console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+          } else {
+            console.error(msg);
+          }
+          return 1;
+        }
+
         const pluginHome = await resolveCliHome(ctx, api);
         const allowInsecure = process.env.BOTMUX_GITHUB_ALLOW_INSECURE_TEST_API === '1';
         const config = await loadPluginConfig(pluginHome, {
@@ -485,7 +532,7 @@ const commands = {
         if (asJson) {
           console.log(JSON.stringify({ ok: false, error: safeErr }, null, 2));
         } else {
-          console.error(`Failed to open PR ${parsed.repo}#${parsed.prNumber}: ${safeErr}`);
+          console.error(`Failed to open PR ${specRaw || '<spec>'}: ${safeErr}`);
         }
         return 1;
       }
@@ -495,18 +542,21 @@ const commands = {
   'github:test-auth': {
     description: 'Test configured GitHub authentication (PAT, GitHub App, or gh auth token) [--repo owner/repo] [--json].',
     async run(ctx?: CliContext, api?: CliApi): Promise<string | number> {
-      const { flags } = parseFlags(ctx?.args ?? []);
-      const asJson = flags.json === true;
-      if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
-        const msg = 'Missing value for --repo (expected owner/repo)';
-        if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
-        else console.error(msg);
-        return 1;
-      }
-      const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
+      const { flags, positional } = parseFlags(ctx?.args ?? []);
       const registry = new SecretRegistry();
+      let asJson = false;
 
       try {
+        asJson = parseBooleanFlag(flags, 'json');
+        assertAllowedArgs(flags, positional, { allowedFlags: ['repo', 'json'], maxPositional: 0 });
+        if (flags.repo === true || (typeof flags.repo === 'string' && !flags.repo.trim())) {
+          const msg = 'Missing value for --repo (expected owner/repo)';
+          if (asJson) console.log(JSON.stringify({ ok: false, error: msg }, null, 2));
+          else console.error(msg);
+          return 1;
+        }
+        const repo = typeof flags.repo === 'string' ? flags.repo.trim() : undefined;
+
         const pluginHome = await resolveCliHome(ctx, api);
         const allowInsecure = process.env.BOTMUX_GITHUB_ALLOW_INSECURE_TEST_API === '1';
         const config = await loadPluginConfig(pluginHome, {

@@ -35,13 +35,21 @@ import { LarkOpenApiClient, normalizeTrustedLarkShareLink } from './lark.ts';
 const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{1,128}$/;
 const MESSAGE_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 const OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,128}$/;
+export const DEFAULT_UNKNOWN_OUTCOME_SETTLE_MS = 120_000;
 
 export interface CliExecFn {
   (
     bin: string,
     args: string[],
     opts: { timeoutMs: number; env: Record<string, string | undefined> },
-  ): Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  ): Promise<{
+    exitCode: number;
+    stdout: string;
+    stderr: string;
+    errorCode?: string;
+    killed?: boolean;
+    signal?: string | null;
+  }>;
 }
 
 export interface HostBridgeOptions {
@@ -51,6 +59,7 @@ export interface HostBridgeOptions {
   registry?: SecretRegistry;
   larkClient?: LarkOpenApiClient;
   cliExec?: CliExecFn;
+  unknownOutcomeSettleMs?: number;
   now?: () => number;
 }
 
@@ -88,7 +97,14 @@ function defaultCliExec(
   bin: string,
   args: string[],
   opts: { timeoutMs: number; env: Record<string, string | undefined> },
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  errorCode?: string;
+  killed?: boolean;
+  signal?: string | null;
+}> {
   return new Promise(resolvePromise => {
     execFile(
       bin,
@@ -100,21 +116,36 @@ function defaultCliExec(
         env: opts.env,
       },
       (err, stdout, stderr) => {
-        const exitCode =
-          err && typeof (err as { code?: unknown }).code === 'number'
-            ? ((err as { code: number }).code)
-            : err
-              ? 1
-              : 0;
+        const rawCode = err ? (err as { code?: unknown }).code : undefined;
+        const exitCode = typeof rawCode === 'number' ? rawCode : err ? 1 : 0;
+        const errorCode = typeof rawCode === 'string' ? rawCode : undefined;
+        const killed = Boolean(err && (err as { killed?: boolean }).killed);
+        const signal = err ? ((err as { signal?: string | null }).signal ?? null) : null;
         resolvePromise({
           exitCode,
           stdout: String(stdout ?? ''),
           stderr: String(stderr ?? ''),
+          ...(errorCode ? { errorCode } : {}),
+          ...(killed ? { killed } : {}),
+          ...(signal ? { signal } : {}),
         });
       },
     );
   });
 }
+
+class CliPreCreateError extends Error {
+  readonly definitelyNotCreated = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'CliPreCreateError';
+  }
+}
+
+// Strictly line-anchored CLI pre-create validation errors (prevents false-matching post-create errors or echoed PR text)
+const DEFINITE_CLI_PRECREATE_ERR_RE =
+  /^(?:Error:\s*)?(?:working-dir path does not exist;\s*chat\.create not called|invalid_working_dir|invalid_chat_mode|kickoff_bot_not_selected|--kickoff-bot\b[^\n]*requires|Usage:\s*botmux\s+create-group)\b/im;
+const ANY_CHAT_ID_IN_OUTPUT_RE = /\boc_[A-Za-z0-9_-]{4,128}\b/;
 
 function makeDeterministicRequestId(seed: string): string {
   const hash = createHash('sha256').update(seed).digest('hex').slice(0, 32);
@@ -247,6 +278,7 @@ export class HostBridge {
   private readonly registry: SecretRegistry;
   private readonly larkClient: LarkOpenApiClient;
   private readonly cliExec: CliExecFn;
+  private readonly unknownOutcomeSettleMs: number;
   private readonly now: () => number;
 
   constructor(opts: HostBridgeOptions) {
@@ -261,6 +293,10 @@ export class HostBridge {
         now: opts.now,
       });
     this.cliExec = opts.cliExec ?? defaultCliExec;
+    this.unknownOutcomeSettleMs = Math.max(
+      0,
+      opts.unknownOutcomeSettleMs ?? DEFAULT_UNKNOWN_OUTCOME_SETTLE_MS,
+    );
     this.now = opts.now ?? (() => Date.now());
   }
 
@@ -324,11 +360,13 @@ export class HostBridge {
         `Daemon GET /api/groups failed (${resp.status}): ${this.registry.redactString(resp.rawText.slice(0, 200))}`,
       );
     }
-    const chats = (resp.json as { chats?: unknown }).chats;
-    if (!Array.isArray(chats)) {
-      return { groups: [], ipcPort: daemon.ipcPort, secret };
+    const respObj = resp.json as { ok?: unknown; chats?: unknown; error?: unknown };
+    if (respObj.ok === false || !Array.isArray(respObj.chats)) {
+      throw new Error(
+        `Daemon GET /api/groups returned invalid payload: ${this.registry.redactString(String(respObj.error ?? resp.rawText.slice(0, 200)))}`,
+      );
     }
-    const groups: DaemonGroupItem[] = chats
+    const groups: DaemonGroupItem[] = respObj.chats
       .filter(
         (c): c is DaemonGroupItem =>
           Boolean(c && typeof c === 'object' && typeof (c as DaemonGroupItem).chatId === 'string'),
@@ -694,22 +732,27 @@ export class HostBridge {
       .split(/\r?\n/)
       .map(l => l.trim())
       .filter(Boolean);
-    const line1 = lines[0] ?? '';
-    const line2 = lines[1] ?? '';
 
-    let chatId = CHAT_ID_RE.test(line1) ? line1 : '';
+    let chatId = '';
     let kickoffMessageId: string | null = null;
     let kickoffError: string | null = null;
+    let structuredDefinitelyNotCreated = false;
 
-    if (line2) {
+    const tryInspectStatusJson = (rawLine: string) => {
+      if (!rawLine || !rawLine.startsWith('{')) return;
       try {
-        const parsed = JSON.parse(line2) as {
+        const parsed = JSON.parse(rawLine) as {
           chatId?: unknown;
+          chatCreated?: unknown;
+          definitelyNotCreated?: unknown;
           kickoffMessageId?: unknown;
           kickoffError?: unknown;
         };
         if (!chatId && typeof parsed.chatId === 'string' && CHAT_ID_RE.test(parsed.chatId)) {
           chatId = parsed.chatId;
+        }
+        if (parsed.definitelyNotCreated === true || parsed.chatCreated === false) {
+          structuredDefinitelyNotCreated = true;
         }
         if (typeof parsed.kickoffMessageId === 'string' && MESSAGE_ID_RE.test(parsed.kickoffMessageId)) {
           kickoffMessageId = parsed.kickoffMessageId;
@@ -718,15 +761,38 @@ export class HostBridge {
           kickoffError = parsed.kickoffError;
         }
       } catch {
-        // Ignore malformed line 2 if chatId already captured from line 1
+        // Ignore malformed JSON line
       }
+    };
+
+    // Scan ALL stdout lines for bare chatId or JSON status objects
+    for (const line of lines) {
+      if (!chatId && CHAT_ID_RE.test(line)) {
+        chatId = line;
+      }
+      tryInspectStatusJson(line);
+    }
+    for (const sLine of result.stderr.split(/\r?\n/).map(l => l.trim()).filter(Boolean)) {
+      tryInspectStatusJson(sLine);
     }
 
-    // Even if exitCode !== 0, if chatId was flushed on stdout line 1, return it so we NEVER create a duplicate!
+    // Even if exitCode !== 0, if chatId was flushed on stdout, return it so we NEVER create a duplicate!
     if (!chatId) {
-      throw new Error(
-        `botmux create-group CLI failed (exit ${result.exitCode}): ${this.registry.redactString(result.stderr.slice(0, 300))}`,
-      );
+      const safeErr = `botmux create-group CLI failed (exit ${result.exitCode}): ${this.registry.redactString(result.stderr.slice(0, 300))}`;
+      const wasKilledOrSignaled = Boolean(result.killed || result.signal);
+      const anyChatIdMentioned =
+        ANY_CHAT_ID_IN_OUTPUT_RE.test(result.stdout) || ANY_CHAT_ID_IN_OUTPUT_RE.test(result.stderr);
+      const binaryNotLaunched = result.errorCode === 'ENOENT' || result.errorCode === 'EACCES';
+      const deterministicPreCreate =
+        !wasKilledOrSignaled &&
+        !anyChatIdMentioned &&
+        (structuredDefinitelyNotCreated ||
+          binaryNotLaunched ||
+          DEFINITE_CLI_PRECREATE_ERR_RE.test(result.stderr));
+      if (deterministicPreCreate) {
+        throw new CliPreCreateError(safeErr);
+      }
+      throw new Error(safeErr);
     }
 
     return { chatId, kickoffMessageId, kickoffError };
@@ -737,23 +803,48 @@ export class HostBridge {
     pr: PullRequestInfo;
     chatId: string;
     shareLink: string;
-  }): Promise<boolean> {
+    existingCommentId?: number;
+  }): Promise<{ posted: boolean; commentId?: number }> {
     const normalizedLink = normalizeTrustedLarkShareLink(opts.shareLink);
     if (!normalizedLink) {
-      return false;
+      return { posted: false };
     }
     const [owner, repo] = opts.pr.repo.split('/');
-    if (!owner || !repo) return false;
+    if (!owner || !repo) return { posted: false };
 
     const marker = `<!-- botmux-plugin-github:share-link:${opts.chatId} -->`;
-    const comments = await opts.githubClient.listIssueComments(owner, repo, opts.pr.number);
-    if (comments.some(c => c.body.includes(marker))) {
-      return true; // Already posted (even if state.json was lost)
+
+    // Fast path: if we previously persisted shareLinkCommentId, verify it directly
+    if (opts.existingCommentId) {
+      const existing = await opts.githubClient.getIssueComment(owner, repo, opts.existingCommentId);
+      if (existing && existing.body.includes(marker)) {
+        return { posted: true, commentId: existing.id };
+      }
+    }
+
+    // Paginate ALL issue comments (stopping early as soon as marker is found!)
+    let matchedId: number | undefined;
+    const scan = await opts.githubClient.listIssueComments(owner, repo, opts.pr.number, {
+      stopWhen: c => {
+        if (c.body.includes(marker)) {
+          matchedId = c.id;
+          return true;
+        }
+        return false;
+      },
+    });
+    if (matchedId !== undefined) {
+      return { posted: true, commentId: matchedId };
+    }
+    if (scan.truncated) {
+      throw new Error(
+        `Refusing to post share-link comment for ${opts.pr.repo}#${opts.pr.number}: comment history scan was truncated before verifying absence of existing marker`,
+      );
     }
 
     const commentBody = buildShareLinkPrComment(normalizedLink, opts.chatId);
-    await opts.githubClient.createIssueComment(owner, repo, opts.pr.number, commentBody);
-    return true;
+    const created = await opts.githubClient.createIssueComment(owner, repo, opts.pr.number, commentBody);
+    return { posted: true, commentId: created.id || undefined };
   }
 
   /**
@@ -779,20 +870,24 @@ export class HostBridge {
       timeoutMs: 45_000,
       staleMs: 90_000,
       pollMs: 30,
+      now: this.now,
     });
 
     try {
-      return await this.ensurePrReviewGroupLocked(opts);
+      return await this.ensurePrReviewGroupLocked(opts, prLock);
     } finally {
       await prLock.release();
     }
   }
 
-  private async ensurePrReviewGroupLocked(opts: {
-    rule: RepoRule;
-    pr: PullRequestInfo;
-    githubClient: GitHubClient;
-  }): Promise<GroupOrchestrationResult> {
+  private async ensurePrReviewGroupLocked(
+    opts: {
+      rule: RepoRule;
+      pr: PullRequestInfo;
+      githubClient: GitHubClient;
+    },
+    prLock: { verifyOwned(): Promise<boolean> },
+  ): Promise<GroupOrchestrationResult> {
     const { rule, pr, githubClient } = opts;
     const prKey = makePrKey(rule.repo, pr.number);
     const groupName = renderSafeGroupName(rule.groupNameTemplate, pr);
@@ -895,8 +990,12 @@ export class HostBridge {
       }
     }
 
-    // Fail closed if a prior create attempt had an unknown outcome (e.g. socket reset/timeout)
-    // and we could NOT verify via creator daemon GET /api/groups whether that group was created!
+    // Fail closed if a prior create attempt had an unknown outcome (e.g. socket reset/timeout):
+    // 1. If GET /api/groups already found & adopted the group above, record.chatId is now set and createAttempt was cleared.
+    // 2. If creator daemon GET /api/groups is unavailable -> ALWAYS fail closed.
+    // 3. Even if GET /api/groups returned empty, an in-flight create on the daemon may still be committing
+    //    (real core does not cancel createChat on client socket drop!). Keep createAttempt.outcomeUnknown=true
+    //    and fail closed until the full safety window (`unknownOutcomeSettleMs`) has elapsed!
     if (!record.chatId && record.createAttempt?.outcomeUnknown) {
       if (!verifiedEmptyViaDaemonGroups) {
         const errMsg = `Prior ${record.createAttempt.path} group creation attempt for ${prKey} has unknown outcome and creator daemon GET /api/groups is currently unavailable; refusing to switch execution path or retry create to prevent duplicate groups.`;
@@ -909,7 +1008,24 @@ export class HostBridge {
         });
         throw new Error(errMsg);
       }
-      // GET /api/groups confirmed no group exists -> safe to clear unknown outcome flag
+
+      const startedMs = Date.parse(record.createAttempt.startedAt);
+      const nowMs = this.now();
+      const timestampInvalidOrFuture = !Number.isFinite(startedMs) || nowMs < startedMs;
+      const elapsedMs = timestampInvalidOrFuture ? 0 : nowMs - startedMs;
+      if (timestampInvalidOrFuture || elapsedMs < this.unknownOutcomeSettleMs) {
+        const errMsg = `Prior ${record.createAttempt.path} group creation attempt for ${prKey} has unknown outcome (elapsed ${elapsedMs}ms < safety settle window ${this.unknownOutcomeSettleMs}ms); keeping fail-closed because empty GET /api/groups cannot rule out an in-flight create.`;
+        await this.stateStore.update(state => {
+          const cur = state.prGroups[prKey];
+          if (cur) {
+            cur.lastError = errMsg;
+            cur.updatedAt = new Date(this.now()).toISOString();
+          }
+        });
+        throw new Error(errMsg);
+      }
+
+      // Past full safety settle window AND GET /api/groups confirmed no matching group exists
       record = await this.stateStore.update(state => {
         const cur = state.prGroups[prKey]!;
         delete cur.createAttempt;
@@ -920,6 +1036,11 @@ export class HostBridge {
 
     // Step 3: Create group ONLY if chatId is still unknown
     if (!record.chatId) {
+      // Fencing check: confirm we still own the per-PR mutex right before mutating external state
+      if (!(await prLock.verifyOwned())) {
+        throw new Error(`Lost ownership of per-PR lock for ${prKey} before group creation`);
+      }
+
       const larkAppIds = [rule.creatorBotAppId];
       for (const id of validMemberBotAppIds) {
         if (!larkAppIds.includes(id)) larkAppIds.push(id);
@@ -931,7 +1052,6 @@ export class HostBridge {
       const attemptId = randomBytes(8).toString('hex');
 
       if (canUseDaemonIpc && creatorDaemon && dashboardSecret) {
-        // Persist unknown-outcome create attempt BEFORE transmitting POST /api/groups/create!
         record = await this.stateStore.update(state => {
           const cur = state.prGroups[prKey]!;
           cur.createAttempt = {
@@ -951,6 +1071,7 @@ export class HostBridge {
           name: groupName,
           larkAppIds,
           chatMode: rule.chatMode,
+          idempotencyKey: attemptId,
           ...(rule.bindWorkingDir ? { bindWorkingDir: rule.bindWorkingDir } : {}),
           ...(userOpenIds.length > 0 ? { userOpenIds } : {}),
           ...(ownerUnionIds.length > 0 ? { ownerUnionIds } : {}),
@@ -1074,11 +1195,40 @@ export class HostBridge {
           return { ...cur };
         });
 
-        const cliRes = await this.createGroupViaCliFallback({
-          rule,
-          groupName,
-          kickoffPrompt: kickoffPromptBase,
-        });
+        let cliRes: {
+          chatId: string;
+          kickoffMessageId: string | null;
+          kickoffError: string | null;
+        };
+        try {
+          cliRes = await this.createGroupViaCliFallback({
+            rule,
+            groupName,
+            kickoffPrompt: kickoffPromptBase,
+          });
+        } catch (err) {
+          if (err instanceof CliPreCreateError) {
+            // Definite pre-create validation failure before chat.create -> safe to clear unknown outcome!
+            await this.stateStore.update(state => {
+              const cur = state.prGroups[prKey];
+              if (cur) {
+                delete cur.createAttempt;
+                cur.lastError = formatSafeError(err, this.registry);
+                cur.updatedAt = new Date(this.now()).toISOString();
+              }
+            });
+          } else {
+            // Ambiguous CLI failure -> keep outcomeUnknown: true (fail closed!)
+            await this.stateStore.update(state => {
+              const cur = state.prGroups[prKey];
+              if (cur) {
+                cur.lastError = `CLI create outcome unknown: ${formatSafeError(err, this.registry)}`;
+                cur.updatedAt = new Date(this.now()).toISOString();
+              }
+            });
+          }
+          throw err;
+        }
         record = await this.stateStore.update(state => {
           const cur = state.prGroups[prKey]!;
           cur.chatId = cliRes.chatId;
@@ -1280,21 +1430,23 @@ export class HostBridge {
       }
     }
 
-    // Step 7: Optional idempotent PR share-link comment (failure keeps status='creating' so retry completes it!)
+    // Step 7: Optional idempotent PR share-link comment (paginates all comments + persists commentId!)
     if (rule.postShareLinkToPr && record.shareLink && !record.shareLinkPosted) {
       try {
-        const posted = await this.postShareLinkIdempotently({
+        const res = await this.postShareLinkIdempotently({
           githubClient,
           pr,
           chatId,
           shareLink: record.shareLink,
+          existingCommentId: record.shareLinkCommentId,
         });
-        if (!posted) {
+        if (!res.posted) {
           throw new Error('Share link rejected by trusted Feishu/Lark domain validation');
         }
         record = await this.stateStore.update(state => {
           const cur = state.prGroups[prKey]!;
           cur.shareLinkPosted = true;
+          if (res.commentId) cur.shareLinkCommentId = res.commentId;
           cur.updatedAt = new Date(this.now()).toISOString();
           return { ...cur };
         });

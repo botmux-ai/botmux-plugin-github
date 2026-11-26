@@ -30,6 +30,7 @@ interface ETagEntry {
   etag: string;
   body: string;
   link?: string;
+  hasNonEmptyNextPage?: boolean;
   usedAt: number;
 }
 
@@ -421,7 +422,7 @@ export class GitHubClient {
     const cachedPage1 = this.etagCache.get(etagKey);
     const knownMultiPage =
       (opts?.previousPageCount !== undefined && opts.previousPageCount > 1) ||
-      Boolean(cachedPage1?.link && hasNextPageLink(cachedPage1.link));
+      cachedPage1?.hasNonEmptyNextPage === true;
 
     // If multi-page across cold restart (no cached page-1 body in memory), bypass ETag once
     // to repopulate full multi-page cache instead of blindly trusting page-1 304.
@@ -533,17 +534,16 @@ export class GitHubClient {
         signal: opts?.signal,
       });
 
-      pageCount = page;
       let pageRawText: string;
       let pageLink: string;
+      let freshLink = '';
       let pageEtag: string | undefined;
 
       if (nextResp.res.status === 304 && cachedPage) {
         const rotated = headerFirst(nextResp.res.headers, 'etag');
         pageEtag = rotated && VALID_ETAG_RE.test(rotated) ? rotated : cachedPage.etag;
         pageRawText = cachedPage.body;
-        const freshLink = headerFirst(nextResp.res.headers, 'link');
-        // If Link header changed from having rel="next" to omitting rel="next", trailing page(s) vanished!
+        freshLink = headerFirst(nextResp.res.headers, 'link');
         if (cachedPage.link && hasNextPageLink(cachedPage.link) && freshLink && !hasNextPageLink(freshLink)) {
           anyPageModified = true;
         }
@@ -554,27 +554,54 @@ export class GitHubClient {
         pageEtag = respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined;
         pageRawText = nextResp.res.body.toString('utf8');
         pageLink = headerFirst(nextResp.res.headers, 'link');
+        freshLink = pageLink;
       }
 
+      const items = JSON.parse(pageRawText) as RawGitHubPr[];
+      if (!Array.isArray(items)) {
+        throw new Error(`Unexpected non-array response listing PRs page ${page} for ${repoSlug}`);
+      }
+      if (items.length === 0) {
+        // Evict stale trailing page from etagCache and clear stale rel="next" on the terminal non-empty page!
+        pendingCacheWrites.push({ key: pageCacheKey, entry: null });
+        const prevWrite = pendingCacheWrites[pendingCacheWrites.length - 2];
+        if (prevWrite?.entry) {
+          prevWrite.entry.link = '';
+          prevWrite.entry.hasNonEmptyNextPage = false;
+        }
+        break;
+      }
+      pageCount = page;
       pendingCacheWrites.push({
         key: pageCacheKey,
         entry: pageEtag
           ? { etag: pageEtag, body: pageRawText, link: pageLink, usedAt: this.now() }
           : null,
       });
-
-      const items = JSON.parse(pageRawText) as RawGitHubPr[];
-      if (!Array.isArray(items) || items.length === 0) break;
       appendItems(items);
-      hasMore =
-        (items.length === 100 && (pageLink === '' || hasNextPageLink(pageLink))) ||
-        (opts?.previousPageCount !== undefined && page < opts.previousPageCount);
+      const cachedTerminalPage =
+        nextResp.res.status === 304 &&
+        cachedPage?.hasNonEmptyNextPage === false &&
+        !hasNextPageLink(freshLink);
+      hasMore = cachedTerminalPage
+        ? opts?.previousPageCount !== undefined && page < opts.previousPageCount
+        : (items.length === 100 && (pageLink === '' || hasNextPageLink(pageLink))) ||
+          (opts?.previousPageCount !== undefined && page < opts.previousPageCount);
       if (page === maxPages && hasMore) {
         truncated = true;
       }
     }
 
     // Only commit per-page ETags AFTER all pages succeed (prevents poisoning on page 2+ errors).
+    // Mark `hasNonEmptyNextPage` accurately on EVERY non-null page entry so exact 100/200-PR repos
+    // never hammer empty trailing pages on subsequent 304 polls!
+    let nonEmptyIdx = 0;
+    for (const write of pendingCacheWrites) {
+      if (write.entry) {
+        nonEmptyIdx++;
+        write.entry.hasNonEmptyNextPage = nonEmptyIdx < pageCount;
+      }
+    }
     if (!opts?.bypassEtag) {
       for (const write of pendingCacheWrites) {
         if (write.entry) {
@@ -633,28 +660,83 @@ export class GitHubClient {
     owner: string,
     repo: string,
     issueNumber: number,
-  ): Promise<IssueComment[]> {
-    const { res } = await this.request({
-      method: 'GET',
-      path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/comments?per_page=100`,
-      resource: 'core',
-      priority: 'non_core',
-    });
-    const raw = JSON.parse(res.body.toString('utf8')) as Array<{
-      id?: unknown;
-      body?: unknown;
-      html_url?: unknown;
-      user?: { login?: unknown } | null;
-    }>;
-    if (!Array.isArray(raw)) return [];
-    return raw
-      .filter(c => typeof c.id === 'number')
-      .map(c => ({
-        id: c.id as number,
+    opts?: { maxPages?: number; stopWhen?: (comment: IssueComment) => boolean },
+  ): Promise<{ comments: IssueComment[]; truncated: boolean }> {
+    const maxPages = Math.max(1, Math.min(opts?.maxPages ?? 50, 100));
+    const all: IssueComment[] = [];
+    let truncated = false;
+
+    for (let page = 1; page <= maxPages; page++) {
+      const { res } = await this.request({
+        method: 'GET',
+        path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${issueNumber}/comments?per_page=100&page=${page}`,
+        resource: 'core',
+        priority: 'non_core',
+      });
+      const raw = JSON.parse(res.body.toString('utf8')) as Array<{
+        id?: unknown;
+        body?: unknown;
+        html_url?: unknown;
+        user?: { login?: unknown } | null;
+      }>;
+      if (!Array.isArray(raw) || raw.length === 0) break;
+
+      for (const c of raw) {
+        if (typeof c.id !== 'number') continue;
+        const item: IssueComment = {
+          id: c.id,
+          body: typeof c.body === 'string' ? c.body : '',
+          htmlUrl: typeof c.html_url === 'string' ? c.html_url : '',
+          userLogin: typeof c.user?.login === 'string' ? c.user.login : 'unknown',
+        };
+        all.push(item);
+        if (opts?.stopWhen?.(item)) {
+          return { comments: all, truncated: false };
+        }
+      }
+
+      const link = headerFirst(res.headers, 'link');
+      const hasMore = raw.length === 100 && (link === '' || hasNextPageLink(link));
+      if (!hasMore) break;
+      if (page === maxPages) {
+        truncated = true;
+      }
+    }
+
+    return { comments: all, truncated };
+  }
+
+  async getIssueComment(
+    owner: string,
+    repo: string,
+    commentId: number,
+  ): Promise<IssueComment | null> {
+    try {
+      const { res } = await this.request({
+        method: 'GET',
+        path: `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/comments/${commentId}`,
+        resource: 'core',
+        priority: 'non_core',
+      });
+      const c = JSON.parse(res.body.toString('utf8')) as {
+        id?: unknown;
+        body?: unknown;
+        html_url?: unknown;
+        user?: { login?: unknown } | null;
+      };
+      if (typeof c.id !== 'number') return null;
+      return {
+        id: c.id,
         body: typeof c.body === 'string' ? c.body : '',
         htmlUrl: typeof c.html_url === 'string' ? c.html_url : '',
         userLogin: typeof c.user?.login === 'string' ? c.user.login : 'unknown',
-      }));
+      };
+    } catch (err) {
+      if (err instanceof GitHubApiError && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
   }
 
   async createIssueComment(

@@ -174,6 +174,7 @@ export interface PrGroupRecord {
   kickoffVerified?: boolean;
   topNoticeSet: boolean;
   shareLinkPosted?: boolean;
+  shareLinkCommentId?: number;
   lifecycleGeneration?: number;
   createAttempt?: GroupCreateAttempt;
   lastHeadSha: string;

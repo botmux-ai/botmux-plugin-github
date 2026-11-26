@@ -54,7 +54,8 @@ export type WebhookEnqueueVerdict =
   | { accepted: false; status: 429 | 503; reason: string };
 
 interface GenerationGuard {
-  gen: number;
+  gen?: number;
+  repoKey?: string;
   signal?: AbortSignal;
 }
 
@@ -161,12 +162,28 @@ export class GitHubWatcher {
     oldAbort.abort();
   }
 
+  private isGuardActive(guard?: GenerationGuard): boolean {
+    if (!guard) return true;
+    if (guard.signal?.aborted) return false;
+    if (guard.gen !== undefined) {
+      if (guard.gen !== this.generation || this.generationAbort.signal.aborted) {
+        return false;
+      }
+    }
+    if (guard.repoKey !== undefined) {
+      if (this.getEnabledRules().length === 0) return false;
+      const liveRule = this.findRuleByRepo(guard.repoKey);
+      if (!liveRule || !liveRule.enabled) return false;
+    }
+    return true;
+  }
+
   private isGenerationCurrent(gen: number, signal?: AbortSignal): boolean {
-    return gen === this.generation && !signal?.aborted && !this.generationAbort.signal.aborted;
+    return this.isGuardActive({ gen, signal });
   }
 
   private assertGenerationCurrent(guard?: GenerationGuard): void {
-    if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) {
+    if (guard && !this.isGuardActive(guard)) {
       throw new GenerationAbortedError();
     }
   }
@@ -422,12 +439,19 @@ export class GitHubWatcher {
       };
     }
 
+    const repoKey = normalizeRepoKey(rule.repo);
     const prKey = makePrKey(rule.repo, opts.pr.number);
-    const enqueueGen = this.generation;
+    // Do NOT tie already-202-accepted webhooks to pollGeneration so active->active reloads
+    // (e.g. changing pollIntervalSec) never silently drop queued webhooks!
+    // Instead, guard by live repo enabled status so active->dormant or disabling the repo still aborts cleanly.
     const enq = this.queue.tryEnqueue(prKey, async taskSignal => {
-      const guard: GenerationGuard = { gen: enqueueGen, signal: taskSignal };
+      const guard: GenerationGuard = { repoKey, signal: taskSignal };
       this.assertGenerationCurrent(guard);
-      await this.processWebhookPrEvent(rule, opts.action, opts.pr, guard);
+      const liveRule = this.findRuleByRepo(repoKey);
+      if (!liveRule || !liveRule.enabled) {
+        throw new GenerationAbortedError();
+      }
+      await this.processWebhookPrEvent(liveRule, opts.action, opts.pr, guard);
       this.assertGenerationCurrent(guard);
       this.deliveryDedup.commit(opts.deliveryId);
       await this.stateStore.recordDelivery(opts.deliveryId);
@@ -447,11 +471,11 @@ export class GitHubWatcher {
 
     enq.promise.catch(err => {
       this.deliveryDedup.abort(opts.deliveryId);
-      // Do NOT mutate state.json or emit spurious errors if aborted by active->dormant reload!
-      if (isAbortError(err) || enqueueGen !== this.generation) {
+      // Do NOT mutate state.json or emit spurious errors if aborted or if repo/watcher went dormant!
+      if (isAbortError(err) || !this.isGuardActive({ repoKey })) {
         return;
       }
-      void this.invalidateRepoEtag(normalizeRepoKey(rule.repo));
+      void this.invalidateRepoEtag(repoKey);
       void this.stateStore
         .appendEvent({
           level: 'error',
@@ -496,7 +520,7 @@ export class GitHubWatcher {
     const commitKnownCursor = async (stateVal: 'open' | 'closed' = pr.state) => {
       this.assertGenerationCurrent(guard);
       await this.stateStore.update(s => {
-        if (!this.isGenerationCurrent(guard.gen, guard.signal)) return;
+        if (!this.isGuardActive(guard)) return;
         const r = s.repos[repoKey] ?? { knownPrs: {} };
         r.knownPrs[String(pr.number)] = {
           headSha: pr.headSha,
@@ -509,10 +533,14 @@ export class GitHubWatcher {
     };
 
     if (action === 'reopened') {
-      await this.handlePrReopened(rule, pr, false, guard);
+      const res = await this.handlePrReopened(rule, pr, false, guard);
       this.assertGenerationCurrent(guard);
-      await commitKnownCursor('open');
       await this.invalidateRepoEtag(repoKey);
+      // Do NOT commit knownPrs as open if deferred by hourly creation cap so next poll retries!
+      if (res.action === 'skip_rate_limited') {
+        return;
+      }
+      await commitKnownCursor('open');
       return;
     }
 
@@ -520,9 +548,13 @@ export class GitHubWatcher {
       const triggerKind = action === 'ready_for_review' ? 'ready_for_review' : 'opened';
       const match = evaluateRepoRule(rule, pr, triggerKind);
       if (match.matched) {
-        await this.handleGroupTrigger(rule, pr, triggerKind, false, undefined, guard);
+        const res = await this.handleGroupTrigger(rule, pr, triggerKind, false, undefined, guard);
         this.assertGenerationCurrent(guard);
         await this.invalidateRepoEtag(repoKey);
+        // Do NOT mark knownPrs if deferred by hourly rate cap so subsequent poll retries!
+        if (res.action === 'skip_rate_limited') {
+          return;
+        }
       }
       await commitKnownCursor('open');
       return;
@@ -569,7 +601,7 @@ export class GitHubWatcher {
     this.assertGenerationCurrent(guard);
     const prKey = makePrKey(repo, prNumber);
     await this.stateStore.update(s => {
-      if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+      if (guard && !this.isGuardActive(guard)) return;
       const g = s.prGroups[prKey];
       if (g) {
         g.status = 'closed';
@@ -618,7 +650,7 @@ export class GitHubWatcher {
         // Bump generation and set status='creating' BEFORE delegating to bridge even if
         // existingGroup.status had not transitioned to 'closed' yet (e.g. onPrClosed was false).
         await this.stateStore.update(s => {
-          if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+          if (guard && !this.isGuardActive(guard)) return;
           const g = s.prGroups[prKey];
           if (g) {
             g.lifecycleGeneration = nextGen;
@@ -641,7 +673,7 @@ export class GitHubWatcher {
       }
 
       await this.stateStore.update(s => {
-        if (guard && !this.isGenerationCurrent(guard.gen, guard.signal)) return;
+        if (guard && !this.isGuardActive(guard)) return;
         const g = s.prGroups[prKey];
         if (g) {
           g.status = 'active';
@@ -990,15 +1022,16 @@ export class GitHubWatcher {
    *   and `creating`) and never advances ETag on ANY per-PR error or close failure.
    */
   async pollRepo(
-    rule: RepoRule,
-    opts?: { dryRun?: boolean; bypassEtag?: boolean; waitForInFlight?: boolean },
+    initialRule: RepoRule,
+    opts?: { dryRun?: boolean; bypassEtag?: boolean; waitForInFlight?: boolean; allowDisabledDryRun?: boolean },
   ): Promise<SyncActionPreview[]> {
-    const repoKey = normalizeRepoKey(rule.repo);
+    const repoKey = normalizeRepoKey(initialRule.repo);
     const dryRun = opts?.dryRun === true;
 
     if (!dryRun) {
-      const existing = this.pollInFlight.get(repoKey);
-      if (existing) {
+      while (true) {
+        const existing = this.pollInFlight.get(repoKey);
+        if (!existing) break;
         if (!opts?.waitForInFlight) {
           return [];
         }
@@ -1006,9 +1039,23 @@ export class GitHubWatcher {
       }
     }
 
+    // Re-resolve LIVE rule AFTER waiting for any in-flight poll so disabling the repo
+    // during the wait immediately halts rather than using a stale rule snapshot!
+    const liveRule = this.findRuleByRepo(repoKey);
+    if (!liveRule) {
+      return [];
+    }
+    if (!liveRule.enabled && !(dryRun && opts?.allowDisabledDryRun)) {
+      return [];
+    }
+    const rule = liveRule;
+
     const pollGen = this.generation;
     const signal = this.generationAbort.signal;
-    const pollGuard: GenerationGuard = { gen: pollGen, signal };
+    const pollGuard: GenerationGuard =
+      dryRun && opts?.allowDisabledDryRun
+        ? { gen: pollGen, signal }
+        : { gen: pollGen, repoKey, signal };
 
     const runPoll = async (): Promise<SyncActionPreview[]> => {
       if (!this.isGenerationCurrent(pollGen, signal)) return [];
@@ -1173,6 +1220,7 @@ export class GitHubWatcher {
       // Normal incremental poll after baseline
       const actions: SyncActionPreview[] = [];
       const failedPrNumbers = new Set<number>();
+      const deferredPrNumbers = new Set<number>();
       let firstErrorReason: string | undefined;
       const openNumbers = new Set<number>();
 
@@ -1182,17 +1230,25 @@ export class GitHubWatcher {
       ): Promise<void> => {
         if (!this.isGenerationCurrent(pollGen, signal)) return;
         if (dryRun) {
-          actions.push(await fn(pollGuard));
+          try {
+            actions.push(await fn(pollGuard));
+          } catch (err) {
+            if (isAbortError(err) || !this.isGenerationCurrent(pollGen, signal)) return;
+            throw err;
+          }
           return;
         }
         const prKey = makePrKey(rule.repo, prNumber);
         try {
           const action = await this.queue.enqueue(prKey, async taskSignal => {
-            const combinedGuard: GenerationGuard = { gen: pollGen, signal: taskSignal };
+            const combinedGuard: GenerationGuard = { gen: pollGen, repoKey, signal: taskSignal };
             this.assertGenerationCurrent(combinedGuard);
             return fn(combinedGuard);
           });
           if (this.isGenerationCurrent(pollGen, signal)) {
+            if (action.action === 'skip_rate_limited') {
+              deferredPrNumbers.add(prNumber);
+            }
             actions.push(action);
           }
         } catch (err) {
@@ -1332,17 +1388,20 @@ export class GitHubWatcher {
       if (!this.isGenerationCurrent(pollGen, signal)) return [];
 
       // Persist updated repo cursor & ETag ONLY cleanly:
-      // If ANY PR task or close confirmation failed, DO NOT advance ETag!
+      // If ANY PR task failed OR was deferred (e.g. hourly group-creation cap / rate limit),
+      // DO NOT advance ETag and DO NOT mark those PRs in knownPrs so they retry cleanly!
       if (!dryRun) {
         const hadPrError = failedPrNumbers.size > 0;
+        const hadDeferred = deferredPrNumbers.size > 0;
+        const shouldHoldEtag = hadPrError || hadDeferred;
         const nowIso = new Date(this.now()).toISOString();
-        if (hadPrError) {
+        if (shouldHoldEtag) {
           github.clearEtagCache();
         }
         await this.stateStore.update(s => {
           if (!this.isGenerationCurrent(pollGen, signal)) return;
           const r = s.repos[repoKey] ?? { knownPrs: {} };
-          if (!hadPrError) {
+          if (!shouldHoldEtag) {
             r.etag = listRes.etag;
             r.etagKey = listRes.etagKey;
             r.lastPageCount = listRes.pageCount;
@@ -1352,15 +1411,20 @@ export class GitHubWatcher {
             delete r.etag;
             delete r.etagKey;
             r.lastPageCount = listRes.pageCount;
-            r.lastPollStatus = 'error';
-            r.lastError = firstErrorReason ?? 'one or more PR actions failed';
+            if (hadPrError) {
+              r.lastPollStatus = 'error';
+              r.lastError = firstErrorReason ?? 'one or more PR actions failed';
+            } else {
+              r.lastPollStatus = 'rate_limited';
+              r.lastError = 'deferred PR(s) pending hourly group creation cap or rate limit';
+            }
           }
           r.filterHash = currentFilterHash;
           r.lastPollAt = nowIso;
 
           const nextKnown: typeof r.knownPrs = { ...r.knownPrs };
           for (const pr of listRes.pulls) {
-            if (failedPrNumbers.has(pr.number)) continue;
+            if (failedPrNumbers.has(pr.number) || deferredPrNumbers.has(pr.number)) continue;
             nextKnown[String(pr.number)] = {
               headSha: pr.headSha,
               draft: pr.draft,
@@ -1371,7 +1435,12 @@ export class GitHubWatcher {
           if (!listRes.truncated) {
             for (const [numStr, cur] of Object.entries(nextKnown)) {
               const num = Number(numStr);
-              if (!openNumbers.has(num) && !failedPrNumbers.has(num) && cur.state === 'open') {
+              if (
+                !openNumbers.has(num) &&
+                !failedPrNumbers.has(num) &&
+                !deferredPrNumbers.has(num) &&
+                cur.state === 'open'
+              ) {
                 nextKnown[numStr] = { ...cur, state: 'closed', updatedAt: nowIso };
               }
             }
@@ -1399,39 +1468,57 @@ export class GitHubWatcher {
 
   async sync(opts?: { repo?: string; dryRun?: boolean }): Promise<SyncResult> {
     const dryRun = opts?.dryRun === true;
-    const enabled = this.getEnabledRules();
-    const targetRules = opts?.repo
-      ? this.config.repos.filter(r => normalizeRepoKey(r.repo) === normalizeRepoKey(opts.repo!))
-      : enabled;
+    const syncGen = this.generation;
+    const initialRepoKeys = opts?.repo
+      ? [normalizeRepoKey(opts.repo)]
+      : this.getEnabledRules().map(r => normalizeRepoKey(r.repo));
 
-    if (targetRules.length === 0) {
+    if (opts?.repo && !this.findRuleByRepo(opts.repo)) {
       return {
-        ok: !opts?.repo,
+        ok: false,
         dryRun,
         mode: this.getMode(),
         actions: [],
-        errors: opts?.repo ? [`No configured rule found for repository "${opts.repo}"`] : [],
+        errors: [`No configured rule found for repository "${opts.repo}"`],
+      };
+    }
+    if (initialRepoKeys.length === 0) {
+      return {
+        ok: true,
+        dryRun,
+        mode: this.getMode(),
+        actions: [],
+        errors: [],
       };
     }
 
     const actions: SyncActionPreview[] = [];
     const errors: string[] = [];
 
-    for (const rule of targetRules) {
+    for (const repoKey of initialRepoKeys) {
+      // Re-resolve current rule & enabled state BEFORE every repo iteration (never reuse stale snapshots!)
+      const liveRule = this.findRuleByRepo(repoKey);
+      if (!liveRule) continue;
+      if (!liveRule.enabled && !(dryRun && opts?.repo)) continue;
+      if (!opts?.repo && this.generation !== syncGen && this.getEnabledRules().length === 0) {
+        break;
+      }
+
       try {
-        const repoActions = await this.pollRepo(rule, {
+        const repoActions = await this.pollRepo(liveRule, {
           dryRun,
           bypassEtag: dryRun,
           waitForInFlight: true,
+          allowDisabledDryRun: Boolean(opts?.repo),
         });
         actions.push(...repoActions);
         for (const a of repoActions) {
           if (a.action === 'error' && a.reason) {
-            errors.push(`${rule.repo}: ${a.reason}`);
+            errors.push(`${liveRule.repo}: ${a.reason}`);
           }
         }
       } catch (err) {
-        errors.push(`${rule.repo}: ${formatSafeError(err, this.registry)}`);
+        errors.push(`${liveRule.repo}: ${formatSafeError(err, this.registry)}`);
       }
     }
 
@@ -1469,14 +1556,14 @@ export class GitHubWatcher {
       };
     }
 
-    if (!Number.isInteger(opts.prNumber) || opts.prNumber < 1) {
+    if (!Number.isSafeInteger(opts.prNumber) || opts.prNumber < 1) {
       return {
         ok: false,
         dryRun,
         repo: canonicalRepo,
         prNumber: opts.prNumber,
         action: 'error',
-        error: 'PR number must be a positive integer',
+        error: 'PR number must be a positive safe integer',
       };
     }
 

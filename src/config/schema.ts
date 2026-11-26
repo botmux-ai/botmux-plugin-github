@@ -249,52 +249,72 @@ export function validateRepoRule(raw: Partial<RepoRule>, index: number): RepoRul
   };
 }
 
+function assertOptionalPlainObject(
+  val: unknown,
+  fieldName: string,
+): Record<string, unknown> {
+  if (val === undefined) return {};
+  if (!val || typeof val !== 'object' || Array.isArray(val)) {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be a JSON object`);
+  }
+  return val as Record<string, unknown>;
+}
+
+function assertOptionalStringField(val: unknown, fieldName: string): string | undefined {
+  if (val === undefined) return undefined;
+  if (typeof val !== 'string') {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be a string`);
+  }
+  return val;
+}
+
 function normalizeAuthMode(raw: unknown): GitHubAuthMode {
+  if (raw === undefined) return 'auto';
   if (raw === 'pat' || raw === 'github_app' || raw === 'gh_cli' || raw === 'auto') {
     return raw;
   }
-  return 'auto';
+  throw new ConfigValidationError(`Invalid github.mode: "${String(raw)}"`);
 }
 
 export function normalizeAndValidateConfig(
   raw: unknown,
   opts?: { allowInsecureLocalApiForTests?: boolean },
 ): PluginConfig {
-  const defaults = createDefaultConfig();
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return defaults;
+    throw new ConfigValidationError('Configuration root must be a JSON object');
   }
   const obj = raw as Record<string, unknown>;
-  const rawGh = (obj.github && typeof obj.github === 'object' ? obj.github : {}) as Record<string, unknown>;
-  const rawApp = (rawGh.app && typeof rawGh.app === 'object' ? rawGh.app : {}) as Record<string, unknown>;
-  const rawProxy = (obj.proxy && typeof obj.proxy === 'object' ? obj.proxy : {}) as Record<string, unknown>;
-  const rawWebhook = (obj.webhook && typeof obj.webhook === 'object' ? obj.webhook : {}) as Record<string, unknown>;
-  const rawService = (obj.service && typeof obj.service === 'object' ? obj.service : {}) as Record<string, unknown>;
+  const rawGh = assertOptionalPlainObject(obj.github, 'github');
+  const rawApp = assertOptionalPlainObject(rawGh.app, 'github.app');
+  const rawProxy = assertOptionalPlainObject(obj.proxy, 'proxy');
+  const rawWebhook = assertOptionalPlainObject(obj.webhook, 'webhook');
+  const rawService = assertOptionalPlainObject(obj.service, 'service');
 
+  const apiBaseUrlField = assertOptionalStringField(rawGh.apiBaseUrl, 'github.apiBaseUrl');
   const apiBaseUrlRaw =
-    typeof rawGh.apiBaseUrl === 'string' && rawGh.apiBaseUrl.trim()
-      ? rawGh.apiBaseUrl.trim().replace(/\/+$/, '')
+    apiBaseUrlField && apiBaseUrlField.trim()
+      ? apiBaseUrlField.trim().replace(/\/+$/, '')
       : DEFAULT_GITHUB_API_BASE_URL;
   validateGitHubApiBaseUrl(apiBaseUrlRaw, {
     allowInsecureLocalForTests: opts?.allowInsecureLocalApiForTests,
   });
 
   const mode = normalizeAuthMode(rawGh.mode);
-  const pat = typeof rawGh.pat === 'string' && rawGh.pat.trim() ? rawGh.pat.trim() : undefined;
+  const patField = assertOptionalStringField(rawGh.pat, 'github.pat');
+  const pat = patField && patField.trim() ? patField.trim() : undefined;
+  const ghHostnameField = assertOptionalStringField(rawGh.ghHostname, 'github.ghHostname');
   const ghHostname =
-    typeof rawGh.ghHostname === 'string' && rawGh.ghHostname.trim()
-      ? rawGh.ghHostname.trim()
-      : undefined;
+    ghHostnameField && ghHostnameField.trim() ? ghHostnameField.trim() : undefined;
   if (ghHostname && !GH_HOSTNAME_RE.test(ghHostname)) {
     throw new ConfigValidationError(`Invalid ghHostname: "${ghHostname}"`);
   }
 
-  const appId = typeof rawApp.appId === 'string' ? rawApp.appId.trim() : '';
-  const installationId = typeof rawApp.installationId === 'string' ? rawApp.installationId.trim() : '';
-  const privateKeyPem =
-    typeof rawApp.privateKeyPem === 'string' && rawApp.privateKeyPem.trim()
-      ? rawApp.privateKeyPem.trim()
-      : undefined;
+  const appId = (assertOptionalStringField(rawApp.appId, 'github.app.appId') ?? '').trim();
+  const installationId = (
+    assertOptionalStringField(rawApp.installationId, 'github.app.installationId') ?? ''
+  ).trim();
+  const pemField = assertOptionalStringField(rawApp.privateKeyPem, 'github.app.privateKeyPem');
+  const privateKeyPem = pemField && pemField.trim() ? pemField.trim() : undefined;
 
   if (appId && !/^\d{1,20}$/.test(appId)) {
     throw new ConfigValidationError('github.app.appId must be numeric');
@@ -306,15 +326,12 @@ export function normalizeAndValidateConfig(
     validatePrivateKeyPem(privateKeyPem);
   }
 
-  const proxyUrl = typeof rawProxy.url === 'string' ? rawProxy.url.trim() : '';
+  const proxyUrl = (assertOptionalStringField(rawProxy.url, 'proxy.url') ?? '').trim();
+  const proxyUserField = assertOptionalStringField(rawProxy.username, 'proxy.username');
   const proxyUsername =
-    typeof rawProxy.username === 'string' && rawProxy.username.trim()
-      ? rawProxy.username.trim()
-      : undefined;
-  const proxyPassword =
-    typeof rawProxy.password === 'string' && rawProxy.password.length > 0
-      ? rawProxy.password
-      : undefined;
+    proxyUserField && proxyUserField.trim() ? proxyUserField.trim() : undefined;
+  const proxyPassField = assertOptionalStringField(rawProxy.password, 'proxy.password');
+  const proxyPassword = proxyPassField && proxyPassField.length > 0 ? proxyPassField : undefined;
 
   // Fail-closed proxy validation on save/load if non-empty.
   if (proxyUrl) {
@@ -327,14 +344,17 @@ export function normalizeAndValidateConfig(
     }
   }
 
+  if (rawWebhook.enabled !== undefined && typeof rawWebhook.enabled !== 'boolean') {
+    throw new ConfigValidationError('Config field "webhook.enabled" must be a boolean');
+  }
   const webhookEnabled = rawWebhook.enabled === true;
+  const whSecretField = assertOptionalStringField(rawWebhook.secret, 'webhook.secret');
   const webhookSecret =
-    typeof rawWebhook.secret === 'string' && rawWebhook.secret.trim()
-      ? rawWebhook.secret.trim()
-      : undefined;
+    whSecretField && whSecretField.trim() ? whSecretField.trim() : undefined;
+  const whPathField = assertOptionalStringField(rawWebhook.path, 'webhook.path');
   const webhookPath =
-    typeof rawWebhook.path === 'string' && rawWebhook.path.trim().startsWith('/')
-      ? rawWebhook.path.trim()
+    whPathField && whPathField.trim().startsWith('/')
+      ? whPathField.trim()
       : DEFAULT_WEBHOOK_PATH;
   if (webhookEnabled && !isWebhookSecretAcceptable(webhookSecret)) {
     throw new ConfigValidationError(
@@ -368,7 +388,10 @@ export function normalizeAndValidateConfig(
     );
   }
 
-  const rawRepos = Array.isArray(obj.repos) ? obj.repos : [];
+  if (obj.repos !== undefined && !Array.isArray(obj.repos)) {
+    throw new ConfigValidationError('Config field "repos" must be an array');
+  }
+  const rawRepos = obj.repos ?? [];
   const repos: RepoRule[] = [];
   const seenRepoKeys = new Set<string>();
   for (let i = 0; i < rawRepos.length; i++) {
@@ -413,16 +436,32 @@ export function normalizeAndValidateConfig(
   };
 }
 
-function stripProxyCredentials(rawUrl: string): { displayUrl: string; hasUrlPassword: boolean } {
-  if (!rawUrl || !rawUrl.trim()) return { displayUrl: '', hasUrlPassword: false };
+function extractProxyUrlUserinfo(rawUrl: string): {
+  displayUrl: string;
+  username?: string;
+  password?: string;
+} {
+  if (!rawUrl || !rawUrl.trim()) return { displayUrl: '' };
   try {
     const u = new URL(rawUrl.trim());
-    const hasUrlPassword = Boolean(u.password);
     const host = formatHostForUrl(u.hostname);
     const portPart = u.port ? `:${u.port}` : '';
-    return { displayUrl: `${u.protocol}//${host}${portPart}`, hasUrlPassword };
+    const displayUrl = `${u.protocol}//${host}${portPart}`;
+    let username: string | undefined;
+    let password: string | undefined;
+    try {
+      if (u.username) username = decodeURIComponent(u.username);
+      if (u.password) password = decodeURIComponent(u.password);
+    } catch {
+      // Ignore malformed percent-escape in fallback extraction
+    }
+    return {
+      displayUrl,
+      ...(username ? { username } : {}),
+      ...(password ? { password } : {}),
+    };
   } catch {
-    return { displayUrl: '', hasUrlPassword: false };
+    return { displayUrl: '' };
   }
 }
 
@@ -431,7 +470,8 @@ function stripProxyCredentials(rawUrl: string): { displayUrl: string; hasUrlPass
  * raw tokens, passwords, private keys, or webhook secrets.
  */
 export function redactConfig(cfg: PluginConfig): RedactedPluginConfig {
-  const { displayUrl, hasUrlPassword } = stripProxyCredentials(cfg.proxy.url);
+  const urlInfo = extractProxyUrlUserinfo(cfg.proxy.url);
+  const effectiveUsername = cfg.proxy.username || urlInfo.username;
   return {
     schemaVersion: 1,
     github: {
@@ -446,9 +486,9 @@ export function redactConfig(cfg: PluginConfig): RedactedPluginConfig {
       },
     },
     proxy: {
-      url: displayUrl,
-      ...(cfg.proxy.username ? { username: cfg.proxy.username } : {}),
-      hasPassword: Boolean(cfg.proxy.password) || hasUrlPassword,
+      url: urlInfo.displayUrl,
+      ...(effectiveUsername ? { username: effectiveUsername } : {}),
+      hasPassword: Boolean(cfg.proxy.password) || Boolean(urlInfo.password),
     },
     webhook: {
       enabled: cfg.webhook.enabled,
@@ -550,8 +590,8 @@ export function applyConfigPatch(
   );
 
   // Validate incoming proxy.url fail-closed BEFORE stripping embedded credentials!
-  const nextProxyUrlRaw =
-    patch.proxy?.url !== undefined ? patch.proxy.url.trim() : current.proxy.url;
+  const urlProvidedInPatch = patch.proxy?.url !== undefined;
+  const nextProxyUrlRaw = urlProvidedInPatch ? patch.proxy!.url!.trim() : current.proxy.url;
   const proxyTargetChanged =
     normalizedOriginKey(nextProxyUrlRaw) !== normalizedOriginKey(current.proxy.url);
 
@@ -564,15 +604,18 @@ export function applyConfigPatch(
       throw new ConfigValidationError(precheck.error.message);
     }
     const parsed = new URL(nextProxyUrlRaw);
-    if (parsed.username) embeddedUser = decodeURIComponent(parsed.username);
-    if (parsed.password) {
-      const dec = decodeURIComponent(parsed.password);
-      if (MASK_SENTINEL_RE.test(dec.trim())) {
-        throw new ConfigValidationError('Refused masked placeholder for proxy.password');
+    // Only treat embedded userinfo as incoming patch overrides when patch.proxy.url was explicitly supplied!
+    if (urlProvidedInPatch) {
+      if (parsed.username) embeddedUser = decodeURIComponent(parsed.username);
+      if (parsed.password) {
+        const dec = decodeURIComponent(parsed.password);
+        if (MASK_SENTINEL_RE.test(dec.trim())) {
+          throw new ConfigValidationError('Refused masked placeholder for proxy.password');
+        }
+        embeddedPass = dec;
       }
-      embeddedPass = dec;
     }
-    // Strip embedded credentials from stored proxy.url; keep creds in username/password fields.
+    // Always strip embedded credentials from stored proxy.url; credentials live in proxy.username/proxy.password.
     if (parsed.username || parsed.password) {
       const host = formatHostForUrl(parsed.hostname);
       const portPart = parsed.port ? `:${parsed.port}` : '';
@@ -580,7 +623,14 @@ export function applyConfigPatch(
     }
   }
 
-  const basePasswordForMerge = proxyTargetChanged ? undefined : current.proxy.password;
+  // Migrate any userinfo credentials currently stored inside current.proxy.url so
+  // saving redacted Dashboard settings NEVER silently drops existing proxy auth,
+  // while partial patches like { proxy: { clearPassword: true } } or { proxy: { username: 'bob' } } still work!
+  const currentUrlInfo = extractProxyUrlUserinfo(current.proxy.url);
+  const existingProxyUsername = current.proxy.username || currentUrlInfo.username;
+  const existingProxyPassword = current.proxy.password || currentUrlInfo.password;
+
+  const basePasswordForMerge = proxyTargetChanged ? undefined : existingProxyPassword;
   const nextProxyPassword = embeddedPass
     ? embeddedPass
     : resolveSecretPatch(
@@ -589,14 +639,18 @@ export function applyConfigPatch(
         patch.proxy?.clearPassword,
         'proxy.password',
       );
+  const explicitUsername =
+    patch.proxy?.username !== undefined ? patch.proxy.username.trim() : undefined;
   const nextProxyUsername =
     embeddedUser !== undefined
       ? embeddedUser
-      : patch.proxy?.username !== undefined
-        ? patch.proxy.username.trim() || undefined
-        : proxyTargetChanged
-          ? undefined
-          : current.proxy.username;
+      : proxyTargetChanged
+        ? explicitUsername || undefined
+        : explicitUsername
+          ? explicitUsername
+          : patch.proxy?.username === '' && current.proxy.username !== undefined
+            ? undefined
+            : existingProxyUsername;
 
   const merged = {
     schemaVersion: 1 as const,
