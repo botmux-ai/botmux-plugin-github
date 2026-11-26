@@ -145,6 +145,7 @@ export interface RepoRuntimeState {
   etag?: string;
   etagKey?: string;
   lastPageCount?: number;
+  lastTruncated?: boolean;
   filterHash?: string;
   baselineCapturedAt?: string;
   lastPollAt?: string;

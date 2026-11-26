@@ -1,4 +1,5 @@
-import { constants as fsConstants, promises as fsp } from 'node:fs';
+import { constants as fsConstants, existsSync, promises as fsp, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import { dirname, basename, join, parse as parsePath, relative, resolve, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -315,7 +316,92 @@ interface LockPayload {
   pid: number;
   startedAt: number;
   heartbeatAt?: number;
+  processIdentity?: string;
   nonce: string;
+}
+
+const LINUX_BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+let cachedLinuxBootId: string | null | undefined;
+
+export function readLinuxBootIdentity(): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  if (cachedLinuxBootId !== undefined) return cachedLinuxBootId ?? undefined;
+  try {
+    const raw = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    cachedLinuxBootId = LINUX_BOOT_ID_RE.test(raw) ? raw.toLowerCase() : null;
+  } catch {
+    cachedLinuxBootId = null;
+  }
+  return cachedLinuxBootId ?? undefined;
+}
+
+type ProcIdentityProbe =
+  | { status: 'alive'; identity: string }
+  | { status: 'dead' }
+  | { status: 'unknown' };
+
+function probeLinuxProcIdentity(pid: number): ProcIdentityProbe {
+  try {
+    const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closeParen = raw.lastIndexOf(')');
+    if (closeParen < 0) return { status: 'unknown' };
+    const fields = raw.slice(closeParen + 2).trim().split(/\s+/);
+    // Field 3 (index 0) is state; zombie 'Z' and dead 'X'/'x' cannot hold locks
+    if (fields[0] === 'Z' || fields[0] === 'X' || fields[0] === 'x') {
+      return { status: 'dead' };
+    }
+    const startTicks = fields[19];
+    if (!startTicks || !/^\d+$/.test(startTicks)) {
+      return { status: 'unknown' };
+    }
+    const bootId = readLinuxBootIdentity();
+    return { status: 'alive', identity: bootId ? `${bootId}:${startTicks}` : startTicks };
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === 'ENOENT' || code === 'ESRCH') {
+      return { status: 'dead' };
+    }
+    // Transient errors (EMFILE, EACCES, etc.) must NOT be misclassified as dead
+    return { status: 'unknown' };
+  }
+}
+
+function probeDurableProcessIdentity(pid: number): ProcIdentityProbe {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return { status: 'dead' };
+  if (process.platform === 'linux') {
+    return probeLinuxProcIdentity(pid);
+  }
+  if (process.platform === 'darwin' || process.platform === 'freebsd') {
+    const psBin = existsSync('/bin/ps') ? '/bin/ps' : existsSync('/usr/bin/ps') ? '/usr/bin/ps' : null;
+    if (!psBin) return { status: 'unknown' };
+    try {
+      const out = execFileSync(psBin, ['-o', 'stat=,lstart=', '-p', String(pid)], {
+        encoding: 'utf8',
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+      }).trim();
+      if (!out) return { status: 'dead' };
+      const firstSpace = out.search(/\s+/);
+      if (firstSpace <= 0) return { status: 'unknown' };
+      const stat = out.slice(0, firstSpace).trim();
+      const lstart = out.slice(firstSpace).trim();
+      if (stat.startsWith('Z')) return { status: 'dead' };
+      return lstart ? { status: 'alive', identity: lstart } : { status: 'unknown' };
+    } catch {
+      return { status: 'unknown' };
+    }
+  }
+  return { status: 'unknown' };
+}
+
+/**
+ * Returns a durable process-birth + boot identity string for `pid` (including PID 1
+ * inside containers) to distinguish the original lock owner from PID reuse or reboot.
+ */
+export function readDurableProcessIdentity(pid: number): string | undefined {
+  const probed = probeDurableProcessIdentity(pid);
+  return probed.status === 'alive' ? probed.identity : undefined;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -367,6 +453,9 @@ async function readLockPayload(
           pid: parsed.pid,
           startedAt: parsed.startedAt,
           ...(typeof parsed.heartbeatAt === 'number' ? { heartbeatAt: parsed.heartbeatAt } : {}),
+          ...(typeof parsed.processIdentity === 'string' && parsed.processIdentity.trim()
+            ? { processIdentity: parsed.processIdentity.trim() }
+            : {}),
           nonce: parsed.nonce,
         },
         mtimeMs: st.mtimeMs,
@@ -391,12 +480,16 @@ async function readLockPayload(
 
 /**
  * Acquires an exclusive nonce-tagged lockfile using O_CREAT|O_EXCL|O_NOFOLLOW
- * with liveness-checked stale recovery, periodic heartbeat lease renewal, and
- * nonce-verified fencing + release.
+ * with durable process-birth + boot identity verification, in-place inode mtime
+ * heartbeat renewal, and nonce-verified fencing + release.
  *
- * CRITICAL INVARIANT: A lock owned by a LIVE PID (`isPidAlive(pid) === true`)
- * is NEVER stolen solely due to elapsed wall-clock age (`staleMs`)! Only dead
- * PIDs or empty/corrupt lockfiles older than `staleMs` may be reclaimed.
+ * CRITICAL INVARIANTS:
+ * - A lock owned by the SAME LIVE PROCESS (`pid` alive AND durable `processIdentity`
+ *   matches) is NEVER stolen solely due to elapsed wall-clock age (`staleMs`)!
+ * - A lock whose PID is dead, zombie, or reused by an unrelated process (`processIdentity`
+ *   mismatch or reboot) IS immediately reclaimed!
+ * - Legacy lockfiles without `processIdentity` or empty/corrupt lockfiles are reclaimed
+ *   once older than `staleMs`.
  */
 export async function acquireSecureLock(
   lockPath: string,
@@ -406,6 +499,7 @@ export async function acquireSecureLock(
     pollMs?: number;
     heartbeatIntervalMs?: number;
     now?: () => number;
+    readProcessIdentity?: (pid: number) => string | undefined;
   },
 ): Promise<FileLockHandle> {
   assertCleanPath(lockPath);
@@ -414,13 +508,14 @@ export async function acquireSecureLock(
   await ensureSecureDir(dir);
 
   const now = opts?.now ?? (() => Date.now());
+  const getProcIdentity = opts?.readProcessIdentity ?? readDurableProcessIdentity;
   const timeoutMs = opts?.timeoutMs ?? 10_000;
   const staleMs = opts?.staleMs ?? 30_000;
   const pollMs = opts?.pollMs ?? 25;
   const heartbeatIntervalMs = opts?.heartbeatIntervalMs ?? Math.max(1_000, Math.min(15_000, Math.floor(staleMs / 3)));
   const nonce = randomBytes(16).toString('hex');
-  // Use real monotonic wall clock for wait timeout so injectable fake clocks for staleMs tests never hang
   const waitDeadline = Date.now() + timeoutMs;
+  const selfIdentity = getProcIdentity(process.pid);
 
   while (true) {
     const acquiredAt = now();
@@ -428,6 +523,7 @@ export async function acquireSecureLock(
       pid: process.pid,
       startedAt: acquiredAt,
       heartbeatAt: acquiredAt,
+      ...(selfIdentity ? { processIdentity: selfIdentity } : {}),
       nonce,
     };
     let handle: fsp.FileHandle | undefined;
@@ -537,8 +633,32 @@ export async function acquireSecureLock(
       if (existing) {
         let canSteal = false;
         if (existing.payload) {
-          // Only steal when owner PID is provably dead — NEVER steal from a live owner PID!
-          canSteal = !isPidAlive(existing.payload.pid);
+          if (!isPidAlive(existing.payload.pid)) {
+            canSteal = true;
+          } else if (existing.payload.processIdentity) {
+            // Verify durable process-birth + boot identity to detect zombies, reboots, and PID reuse!
+            // On transient probe failure ('unknown'), do NOT prematurely steal a fresh live lock.
+            if (opts?.readProcessIdentity) {
+              const liveId = getProcIdentity(existing.payload.pid);
+              canSteal = !liveId || liveId !== existing.payload.processIdentity;
+            } else {
+              const probed = probeDurableProcessIdentity(existing.payload.pid);
+              if (probed.status === 'dead') {
+                canSteal = true;
+              } else if (probed.status === 'alive') {
+                canSteal = probed.identity !== existing.payload.processIdentity;
+              } else {
+                canSteal = false;
+              }
+            }
+          } else {
+            // Legacy lockfile lacking processIdentity (cannot prove PID wasn't reused): reclaim after staleMs
+            const lastSeenMs = Math.max(
+              existing.payload.heartbeatAt ?? existing.payload.startedAt,
+              existing.mtimeMs,
+            );
+            canSteal = now() - lastSeenMs > staleMs;
+          }
         } else {
           // Empty/corrupt lockfile (e.g. SIGKILL mid-creation): reclaim after staleMs
           const ageMs = now() - existing.mtimeMs;

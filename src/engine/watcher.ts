@@ -56,6 +56,7 @@ export type WebhookEnqueueVerdict =
 interface GenerationGuard {
   gen?: number;
   repoKey?: string;
+  repoEpoch?: number;
   signal?: AbortSignal;
 }
 
@@ -89,6 +90,7 @@ export class GitHubWatcher {
 
   private pollTimers = new Map<string, ReturnType<typeof setInterval>>();
   private pollInFlight = new Map<string, Promise<SyncActionPreview[]>>();
+  private readonly repoEpochs = new Map<string, number>();
   private generation = 0;
   private generationAbort = new AbortController();
   private started = false;
@@ -96,6 +98,11 @@ export class GitHubWatcher {
 
   constructor(opts: GitHubWatcherOptions) {
     this.config = opts.config;
+    for (const r of this.config.repos) {
+      if (r.enabled) {
+        this.repoEpochs.set(normalizeRepoKey(r.repo), 1);
+      }
+    }
     this.stateStore = opts.stateStore;
     this.discovery = opts.discovery;
     this.registry = opts.registry ?? defaultSecretRegistry;
@@ -162,6 +169,19 @@ export class GitHubWatcher {
     oldAbort.abort();
   }
 
+  private getRepoEpoch(repoKey: string): number {
+    let ep = this.repoEpochs.get(repoKey);
+    if (ep === undefined) {
+      ep = 1;
+      this.repoEpochs.set(repoKey, ep);
+    }
+    return ep;
+  }
+
+  private bumpRepoEpoch(repoKey: string): void {
+    this.repoEpochs.set(repoKey, (this.repoEpochs.get(repoKey) ?? 0) + 1);
+  }
+
   private isGuardActive(guard?: GenerationGuard): boolean {
     if (!guard) return true;
     if (guard.signal?.aborted) return false;
@@ -174,6 +194,9 @@ export class GitHubWatcher {
       if (this.getEnabledRules().length === 0) return false;
       const liveRule = this.findRuleByRepo(guard.repoKey);
       if (!liveRule || !liveRule.enabled) return false;
+      if (guard.repoEpoch !== undefined && this.repoEpochs.get(guard.repoKey) !== guard.repoEpoch) {
+        return false;
+      }
     }
     return true;
   }
@@ -278,6 +301,7 @@ export class GitHubWatcher {
 
     const state = await this.stateStore.load();
     const prevServiceSnapshot = { ...state.service };
+    const prevRepoEpochs = new Map(this.repoEpochs);
 
     // 1. Validate & build candidate clients BEFORE mutating state.json or timers
     let candidateGithub: GitHubClient | null = null;
@@ -306,6 +330,23 @@ export class GitHubWatcher {
 
       this.clearTimers();
       this.bumpGeneration();
+
+      // Update per-repo lifecycle epochs:
+      // - Keep epoch unchanged for repos staying enabled across active -> active reload
+      // - Increment epoch on disable/removal AND on re-enable so pre-disable queued webhooks NEVER run after disable -> re-enable!
+      const prevEnabledKeys = new Set(prevConfig.repos.filter(r => r.enabled).map(r => normalizeRepoKey(r.repo)));
+      const nextEnabledKeys = new Set(nextEnabled.map(r => normalizeRepoKey(r.repo)));
+      for (const oldKey of prevEnabledKeys) {
+        if (!nextEnabledKeys.has(oldKey)) {
+          this.bumpRepoEpoch(oldKey);
+        }
+      }
+      for (const newKey of nextEnabledKeys) {
+        if (!prevEnabledKeys.has(newKey)) {
+          this.bumpRepoEpoch(newKey);
+        }
+      }
+
       this.config = nextConfig;
       this.githubClient = candidateGithub;
       this.hostBridge = candidateBridge;
@@ -316,6 +357,8 @@ export class GitHubWatcher {
       return nextMode;
     } catch (err) {
       this.clearTimers();
+      this.repoEpochs.clear();
+      for (const [k, v] of prevRepoEpochs) this.repoEpochs.set(k, v);
       this.config = prevConfig;
       this.githubClient = prevGithub;
       this.hostBridge = prevBridge;
@@ -337,6 +380,9 @@ export class GitHubWatcher {
     this.started = false;
     this.clearTimers();
     this.bumpGeneration();
+    for (const r of this.getEnabledRules()) {
+      this.bumpRepoEpoch(normalizeRepoKey(r.repo));
+    }
     await this.queue.drain(drainTimeoutMs);
     if (this.githubClient) {
       await this.persistRateLimits();
@@ -440,12 +486,13 @@ export class GitHubWatcher {
     }
 
     const repoKey = normalizeRepoKey(rule.repo);
+    const repoEpoch = this.getRepoEpoch(repoKey);
     const prKey = makePrKey(rule.repo, opts.pr.number);
-    // Do NOT tie already-202-accepted webhooks to pollGeneration so active->active reloads
-    // (e.g. changing pollIntervalSec) never silently drop queued webhooks!
-    // Instead, guard by live repo enabled status so active->dormant or disabling the repo still aborts cleanly.
+    // Tie queued webhooks to the repo's lifecycle epoch (NOT pollGeneration):
+    // - active -> active reloads keep repoEpoch unchanged so 202-accepted webhooks execute cleanly
+    // - disable/removal -> re-enable increments repoEpoch so pre-disable webhooks abort cleanly!
     const enq = this.queue.tryEnqueue(prKey, async taskSignal => {
-      const guard: GenerationGuard = { repoKey, signal: taskSignal };
+      const guard: GenerationGuard = { repoKey, repoEpoch, signal: taskSignal };
       this.assertGenerationCurrent(guard);
       const liveRule = this.findRuleByRepo(repoKey);
       if (!liveRule || !liveRule.enabled) {
@@ -471,8 +518,8 @@ export class GitHubWatcher {
 
     enq.promise.catch(err => {
       this.deliveryDedup.abort(opts.deliveryId);
-      // Do NOT mutate state.json or emit spurious errors if aborted or if repo/watcher went dormant!
-      if (isAbortError(err) || !this.isGuardActive({ repoKey })) {
+      // Do NOT mutate state.json or emit spurious errors if aborted or if repo lifecycle epoch changed!
+      if (isAbortError(err) || !this.isGuardActive({ repoKey, repoEpoch })) {
         return;
       }
       void this.invalidateRepoEtag(repoKey);
@@ -1105,7 +1152,10 @@ export class GitHubWatcher {
           persistedEtag: useEtag ? repoState.etag : undefined,
           persistedEtagKey: useEtag ? repoState.etagKey : undefined,
           previousPageCount: inferredPageCount,
+          previousTruncated: repoState.lastTruncated,
           bypassEtag: !useEtag,
+          skipCacheWrite: dryRun,
+          expectFreshIfNoPersistedEtag: !dryRun && Boolean(repoState.baselineCapturedAt) && !repoState.etag,
           priority: 'core',
           signal,
         });
@@ -1154,6 +1204,7 @@ export class GitHubWatcher {
             r.etag = listRes.etag ?? r.etag;
             r.etagKey = listRes.etagKey;
             r.lastPageCount = listRes.pageCount;
+            r.lastTruncated = listRes.truncated;
             r.lastPollAt = new Date(this.now()).toISOString();
             r.lastPollStatus = 'not_modified';
             delete r.lastError;
@@ -1194,6 +1245,7 @@ export class GitHubWatcher {
               etag: listRes.etag,
               etagKey: listRes.etagKey,
               lastPageCount: listRes.pageCount,
+              lastTruncated: listRes.truncated,
               filterHash: currentFilterHash,
               baselineCapturedAt: nowIso,
               lastPollAt: nowIso,
@@ -1405,12 +1457,14 @@ export class GitHubWatcher {
             r.etag = listRes.etag;
             r.etagKey = listRes.etagKey;
             r.lastPageCount = listRes.pageCount;
+            r.lastTruncated = listRes.truncated;
             r.lastPollStatus = 'ok';
             delete r.lastError;
           } else {
             delete r.etag;
             delete r.etagKey;
             r.lastPageCount = listRes.pageCount;
+            r.lastTruncated = listRes.truncated;
             if (hadPrError) {
               r.lastPollStatus = 'error';
               r.lastError = firstErrorReason ?? 'one or more PR actions failed';

@@ -26,11 +26,13 @@ import { RateLimitTracker } from './ratelimit.ts';
 const MAX_ETAG_CACHE_ENTRIES = 400;
 const VALID_ETAG_RE = /^[\x21-\x7E ]{1,256}$/;
 
+type PageNextState = 'verified_terminal' | 'has_next' | 'unknown_capped';
+
 interface ETagEntry {
   etag: string;
   body: string;
   link?: string;
-  hasNonEmptyNextPage?: boolean;
+  nextState?: PageNextState;
   usedAt: number;
 }
 
@@ -397,7 +399,10 @@ export class GitHubClient {
       persistedEtag?: string;
       persistedEtagKey?: string;
       previousPageCount?: number;
+      previousTruncated?: boolean;
       bypassEtag?: boolean;
+      skipCacheWrite?: boolean;
+      expectFreshIfNoPersistedEtag?: boolean;
       maxPages?: number;
       priority?: 'core' | 'non_core';
       signal?: AbortSignal;
@@ -419,15 +424,29 @@ export class GitHubClient {
     const tokenInfo = await this.authManager.getToken();
     const etagKey = this.makeEtagKey(tokenInfo.principalFingerprint, page1Path);
 
-    const cachedPage1 = this.etagCache.get(etagKey);
+    let cachedPage1 = this.etagCache.get(etagKey);
+    // Invalidate stale in-memory cache if external process cleared persistedEtag or rotated it!
+    const persistedMismatch =
+      (opts?.expectFreshIfNoPersistedEtag === true && !opts?.persistedEtag && Boolean(cachedPage1)) ||
+      (opts?.persistedEtag !== undefined &&
+        opts.persistedEtagKey === etagKey &&
+        Boolean(cachedPage1) &&
+        cachedPage1!.etag !== opts.persistedEtag);
+    if (persistedMismatch) {
+      this.etagCache.clear();
+      cachedPage1 = undefined;
+    }
+
     const knownMultiPage =
       (opts?.previousPageCount !== undefined && opts.previousPageCount > 1) ||
-      cachedPage1?.hasNonEmptyNextPage === true;
+      cachedPage1?.nextState === 'has_next' ||
+      (maxPages > 1 && cachedPage1?.nextState === 'unknown_capped') ||
+      (maxPages > 1 && opts?.previousTruncated === true);
 
-    // If multi-page across cold restart (no cached page-1 body in memory), bypass ETag once
-    // to repopulate full multi-page cache instead of blindly trusting page-1 304.
     const effectiveBypassEtag =
-      opts?.bypassEtag === true || (knownMultiPage && !cachedPage1);
+      opts?.bypassEtag === true ||
+      persistedMismatch ||
+      (knownMultiPage && !cachedPage1);
 
     let sendPage1Etag: string | undefined;
     if (!effectiveBypassEtag) {
@@ -442,7 +461,7 @@ export class GitHubClient {
       }
     }
 
-    const page1Resp = await this.request({
+    let page1Resp = await this.request({
       method: 'GET',
       path: page1Path,
       etag: sendPage1Etag,
@@ -455,15 +474,40 @@ export class GitHubClient {
     let page1Etag: string | undefined;
     let page1RawText: string;
     let page1Link: string;
+    let page1FreshLink = '';
 
     if (page1Resp.res.status === 304) {
       const rotated = headerFirst(page1Resp.res.headers, 'etag');
       page1Etag = rotated && VALID_ETAG_RE.test(rotated) ? rotated : sendPage1Etag;
+      page1FreshLink = headerFirst(page1Resp.res.headers, 'link');
 
-      // Fast path: single-page repository returned 304 -> zero extra requests!
-      if (!knownMultiPage) {
+      const previouslyCappedOnPage1 =
+        cachedPage1?.nextState === 'unknown_capped' || opts?.previousTruncated === true;
+      const freshHasNext = hasNextPageLink(page1FreshLink);
+      const freshExplicitlyTerminal = page1FreshLink !== '' && !freshHasNext;
+
+      if (!knownMultiPage && !freshHasNext && !(previouslyCappedOnPage1 && freshExplicitlyTerminal)) {
         if (cachedPage1 && page1Etag) {
           cachedPage1.etag = page1Etag;
+          cachedPage1.usedAt = this.now();
+        }
+        const page1StillCapped = maxPages === 1 && previouslyCappedOnPage1 && !freshExplicitlyTerminal;
+        return {
+          notModified: true,
+          pulls: [],
+          etag: page1Etag,
+          etagKey,
+          truncated: page1StillCapped,
+          pageCount: 1,
+        };
+      }
+
+      // If 304 reports rel="next" with maxPages===1, keep truncated=true and update cachedPage1
+      if (freshHasNext && maxPages === 1) {
+        if (cachedPage1) {
+          if (page1Etag) cachedPage1.etag = page1Etag;
+          cachedPage1.link = page1FreshLink;
+          cachedPage1.nextState = 'unknown_capped';
           cachedPage1.usedAt = this.now();
         }
         return {
@@ -471,19 +515,42 @@ export class GitHubClient {
           pulls: [],
           etag: page1Etag,
           etagKey,
-          truncated: false,
+          truncated: true,
           pageCount: 1,
         };
       }
 
-      // Multi-page repo: reconstruct page 1 from in-memory cache and validate page 2+
-      page1RawText = cachedPage1!.body;
-      page1Link = headerFirst(page1Resp.res.headers, 'link') || cachedPage1!.link || '';
+      // If capped -> verified_terminal via explicit Link without rel="next", return full page1 pulls
+      // so watcher runs Case 5 to close disappeared page-2+ PRs!
+      if (previouslyCappedOnPage1 && freshExplicitlyTerminal) {
+        anyPageModified = true;
+      }
+
+      if (cachedPage1) {
+        page1RawText = cachedPage1.body;
+        page1Link = page1FreshLink || cachedPage1.link || '';
+      } else {
+        // Cold cache needs unconditional refetch to reconstruct page 1 items
+        page1Resp = await this.request({
+          method: 'GET',
+          path: page1Path,
+          resource: 'core',
+          priority: opts?.priority ?? 'core',
+          signal: opts?.signal,
+        });
+        anyPageModified = true;
+        const respEtag = headerFirst(page1Resp.res.headers, 'etag');
+        page1Etag = respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined;
+        page1RawText = page1Resp.res.body.toString('utf8');
+        page1Link = headerFirst(page1Resp.res.headers, 'link');
+        page1FreshLink = page1Link;
+      }
     } else {
       const respEtag = headerFirst(page1Resp.res.headers, 'etag');
       page1Etag = respEtag && VALID_ETAG_RE.test(respEtag) ? respEtag : undefined;
       page1RawText = page1Resp.res.body.toString('utf8');
       page1Link = headerFirst(page1Resp.res.headers, 'link');
+      page1FreshLink = page1Link;
     }
 
     const page1Items = JSON.parse(page1RawText) as RawGitHubPr[];
@@ -504,8 +571,9 @@ export class GitHubClient {
     };
     appendItems(page1Items);
 
-    const pendingCacheWrites: Array<{ key: string; entry: ETagEntry | null }> = [
+    const pendingCacheWrites: Array<{ page: number; key: string; entry: ETagEntry | null }> = [
       {
+        page: 1,
         key: etagKey,
         entry: page1Etag
           ? { etag: page1Etag, body: page1RawText, link: page1Link, usedAt: this.now() }
@@ -515,9 +583,23 @@ export class GitHubClient {
 
     let truncated = false;
     let pageCount = 1;
-    let hasMore =
-      (page1Items.length === 100 && (page1Link === '' || hasNextPageLink(page1Link))) ||
-      (knownMultiPage && page1Items.length === 100);
+    const page1Was304 = page1Resp.res.status === 304 && Boolean(cachedPage1);
+    const page1VerifiedTerminalOn304 =
+      page1Was304 &&
+      cachedPage1!.nextState === 'verified_terminal' &&
+      !hasNextPageLink(page1FreshLink) &&
+      !(maxPages === 1 && opts?.previousTruncated === true && page1FreshLink === '');
+    let hasMore = page1VerifiedTerminalOn304
+      ? opts?.previousPageCount !== undefined && 1 < opts.previousPageCount
+      : (page1Items.length === 100 && (page1Link === '' || hasNextPageLink(page1Link))) ||
+        (page1Was304 &&
+          (cachedPage1!.nextState === 'unknown_capped' || opts?.previousTruncated === true) &&
+          (page1FreshLink === '' || hasNextPageLink(page1FreshLink))) ||
+        (knownMultiPage && page1Items.length === 100 && (page1FreshLink === '' || hasNextPageLink(page1FreshLink)));
+
+    if (maxPages === 1 && hasMore) {
+      truncated = true;
+    }
 
     for (let page = 2; hasMore && page <= maxPages; page++) {
       const pagePath = makePagePath(page);
@@ -544,7 +626,12 @@ export class GitHubClient {
         pageEtag = rotated && VALID_ETAG_RE.test(rotated) ? rotated : cachedPage.etag;
         pageRawText = cachedPage.body;
         freshLink = headerFirst(nextResp.res.headers, 'link');
-        if (cachedPage.link && hasNextPageLink(cachedPage.link) && freshLink && !hasNextPageLink(freshLink)) {
+        if (
+          cachedPage.link &&
+          hasNextPageLink(cachedPage.link) &&
+          freshLink &&
+          !hasNextPageLink(freshLink)
+        ) {
           anyPageModified = true;
         }
         pageLink = freshLink || cachedPage.link || '';
@@ -562,47 +649,62 @@ export class GitHubClient {
         throw new Error(`Unexpected non-array response listing PRs page ${page} for ${repoSlug}`);
       }
       if (items.length === 0) {
-        // Evict stale trailing page from etagCache and clear stale rel="next" on the terminal non-empty page!
-        pendingCacheWrites.push({ key: pageCacheKey, entry: null });
+        pendingCacheWrites.push({ page, key: pageCacheKey, entry: null });
         const prevWrite = pendingCacheWrites[pendingCacheWrites.length - 2];
         if (prevWrite?.entry) {
           prevWrite.entry.link = '';
-          prevWrite.entry.hasNonEmptyNextPage = false;
+          prevWrite.entry.nextState = 'verified_terminal';
         }
         break;
       }
       pageCount = page;
       pendingCacheWrites.push({
+        page,
         key: pageCacheKey,
         entry: pageEtag
           ? { etag: pageEtag, body: pageRawText, link: pageLink, usedAt: this.now() }
           : null,
       });
       appendItems(items);
-      const cachedTerminalPage =
-        nextResp.res.status === 304 &&
-        cachedPage?.hasNonEmptyNextPage === false &&
-        !hasNextPageLink(freshLink);
-      hasMore = cachedTerminalPage
-        ? opts?.previousPageCount !== undefined && page < opts.previousPageCount
-        : (items.length === 100 && (pageLink === '' || hasNextPageLink(pageLink))) ||
+
+      const is304Hit = nextResp.res.status === 304 && Boolean(cachedPage);
+      const previousWasCappedHere =
+        page === maxPages && opts?.previousTruncated === true && freshLink === '';
+      if (
+        is304Hit &&
+        cachedPage!.nextState === 'verified_terminal' &&
+        !hasNextPageLink(freshLink) &&
+        !previousWasCappedHere
+      ) {
+        hasMore = opts?.previousPageCount !== undefined && page < opts.previousPageCount;
+      } else if (
+        is304Hit &&
+        (cachedPage!.nextState === 'unknown_capped' || previousWasCappedHere) &&
+        (freshLink === '' || hasNextPageLink(freshLink))
+      ) {
+        hasMore = true;
+      } else {
+        hasMore =
+          (items.length === 100 && (pageLink === '' || hasNextPageLink(pageLink))) ||
           (opts?.previousPageCount !== undefined && page < opts.previousPageCount);
+      }
+
       if (page === maxPages && hasMore) {
         truncated = true;
       }
     }
 
-    // Only commit per-page ETags AFTER all pages succeed (prevents poisoning on page 2+ errors).
-    // Mark `hasNonEmptyNextPage` accurately on EVERY non-null page entry so exact 100/200-PR repos
-    // never hammer empty trailing pages on subsequent 304 polls!
-    let nonEmptyIdx = 0;
+    // Classify every cached page by its exact 1-based page number (safe even if an earlier page omitted ETag)
     for (const write of pendingCacheWrites) {
       if (write.entry) {
-        nonEmptyIdx++;
-        write.entry.hasNonEmptyNextPage = nonEmptyIdx < pageCount;
+        if (write.page < pageCount) {
+          write.entry.nextState = 'has_next';
+        } else {
+          write.entry.nextState = truncated ? 'unknown_capped' : 'verified_terminal';
+        }
       }
     }
-    if (!opts?.bypassEtag) {
+    if (!opts?.skipCacheWrite) {
       for (const write of pendingCacheWrites) {
         if (write.entry) {
           this.putEtagEntry(write.key, write.entry);
@@ -618,7 +720,7 @@ export class GitHubClient {
         pulls: [],
         etag: page1Etag,
         etagKey,
-        truncated: false,
+        truncated,
         pageCount,
       };
     }

@@ -142,9 +142,27 @@ class CliPreCreateError extends Error {
   }
 }
 
-// Strictly line-anchored CLI pre-create validation errors (prevents false-matching post-create errors or echoed PR text)
-const DEFINITE_CLI_PRECREATE_ERR_RE =
-  /^(?:Error:\s*)?(?:working-dir path does not exist;\s*chat\.create not called|invalid_working_dir|invalid_chat_mode|kickoff_bot_not_selected|--kickoff-bot\b[^\n]*requires|Usage:\s*botmux\s+create-group)\b/im;
+// Strictly line-anchored REAL Botmux core CLI pre-create validation errors
+// (aligned with Botmux src/cli.ts cmdCreateGroup + src/core/working-dir.ts + src/cli/create-group-resolver.ts,
+// covering both English and Chinese i18n outputs before createGroupWithBots is ever invoked).
+const DEFINITE_CLI_PRECREATE_ERR_RE = new RegExp(
+  '^(?:' +
+    '--working-dir\\s+(?:Directory does not exist:|Path is not a directory:|Cannot read path:|目录不存在：|路径不是目录：|无法读取路径：|不能为空。)' +
+    '|--chat-mode\\s+只支持\\s+group\\s+或\\s+topic' +
+    '|无法解析的\\s+--bot\\s+引用:' +
+    '|未解析到任何\\s+bot' +
+    '|加载\\s+bots\\.json\\s+失败:' +
+    '|注册\\s+bot\\s+失败:' +
+    '|create-group\\s+不再支持\\s+--chat' +
+    '|botmux\\s+create-group\\s+is\\s+unavailable:' +
+    '|用法:\\s*botmux\\s+create-group\\b' +
+    '|至少传一个\\s+--bot。' +
+    '|--kickoff-bot\\s+(?:[与和]\\s+--kickoff-prompt|未匹配到本机\\s+bot:|匹配到多个本机\\s+bot|必须属于本次\\s+--bot|不能是|不在|未在|必须)' +
+    '|--kickoff-prompt\\s+(?:需要|必须|不能)' +
+    '|(?:Error:\\s*)?(?:invalid_working_dir|invalid_chat_mode|kickoff_bot_not_selected|Usage:\\s*botmux\\s+create-group)\\b' +
+    ')',
+  'm',
+);
 const ANY_CHAT_ID_IN_OUTPUT_RE = /\boc_[A-Za-z0-9_-]{4,128}\b/;
 
 function makeDeterministicRequestId(seed: string): string {

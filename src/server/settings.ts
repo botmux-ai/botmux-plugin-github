@@ -345,10 +345,13 @@ export async function saveSettings(
 
     if (action === 'testAuth') {
       const repo = typeof payload.repo === 'string' ? payload.repo.trim() : undefined;
-      const incomingPatch =
-        payload.patch && typeof payload.patch === 'object'
-          ? (payload.patch as PluginConfigPatch)
-          : undefined;
+      let incomingPatch: PluginConfigPatch | undefined;
+      if (Object.hasOwn(payload, 'patch') && payload.patch !== undefined) {
+        if (!payload.patch || typeof payload.patch !== 'object' || Array.isArray(payload.patch)) {
+          return { ok: false, error: 'Invalid settings patch: expected JSON object' };
+        }
+        incomingPatch = payload.patch as PluginConfigPatch;
+      }
 
       // Refuse attaching stored write-only credentials to an unsaved patch pointing at a different origin
       if (incomingPatch && apiOriginChanged(current.github.apiBaseUrl, incomingPatch.github?.apiBaseUrl)) {
@@ -486,10 +489,15 @@ export async function saveSettings(
     }
 
     // Default: saveConfig
-    const patch =
-      payload.patch && typeof payload.patch === 'object'
-        ? (payload.patch as PluginConfigPatch)
-        : (payload as PluginConfigPatch);
+    let patch: PluginConfigPatch;
+    if (Object.hasOwn(payload, 'patch') && payload.patch !== undefined) {
+      if (!payload.patch || typeof payload.patch !== 'object' || Array.isArray(payload.patch)) {
+        return { ok: false, error: 'Invalid settings patch: expected JSON object' };
+      }
+      patch = payload.patch as PluginConfigPatch;
+    } else {
+      patch = payload as PluginConfigPatch;
+    }
 
     const next = applyConfigPatch(current, patch, {
       allowInsecureLocalApiForTests: allowInsecure,

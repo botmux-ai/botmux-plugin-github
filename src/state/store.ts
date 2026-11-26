@@ -82,14 +82,24 @@ function pruneMapByTimestamp(map: Record<string, string>, maxEntries: number, mi
   }
 }
 
-function toSafeStringRecord(raw: unknown): Record<string, string> {
+function toSafeStringRecord(
+  raw: Record<string, unknown> | undefined,
+  statePath: string,
+  fieldName: string,
+): Record<string, string> {
   const out = Object.create(null) as Record<string, string>;
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
-  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
-    if (typeof v === 'string') {
-      out[k] = v;
+  if (!raw) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') {
+      throw new StateCorruptError(statePath, `forbidden key "${k}" inside "${fieldName}"`);
     }
+    if (typeof v !== 'string') {
+      throw new StateCorruptError(
+        statePath,
+        `entry "${fieldName}[${k}]" must be a string (got ${typeof v})`,
+      );
+    }
+    out[k] = v;
   }
   return out;
 }
@@ -112,38 +122,96 @@ function normalizeState(raw: unknown, statePath: string): PluginState {
     throw new StateCorruptError(statePath, 'root JSON value must be an object');
   }
   const obj = raw as Record<string, unknown>;
+  if (obj.schemaVersion !== undefined && obj.schemaVersion !== 1) {
+    throw new StateCorruptError(
+      statePath,
+      `unsupported schemaVersion: ${String(obj.schemaVersion)}`,
+    );
+  }
+
   const repos = assertStateMapField(statePath, obj.repos, 'repos');
-  if (repos) base.repos = repos as Record<string, RepoRuntimeState>;
+  if (repos) {
+    for (const [repoKey, entry] of Object.entries(repos)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new StateCorruptError(statePath, `entry "repos[${repoKey}]" must be an object`);
+      }
+      const rec = entry as Record<string, unknown>;
+      if (rec.knownPrs !== undefined) {
+        assertStateMapField(statePath, rec.knownPrs, `repos[${repoKey}].knownPrs`);
+      }
+    }
+    base.repos = repos as Record<string, RepoRuntimeState>;
+  }
 
   const prGroups = assertStateMapField(statePath, obj.prGroups, 'prGroups');
-  if (prGroups) base.prGroups = prGroups as Record<string, PrGroupRecord>;
+  if (prGroups) {
+    for (const [prKey, entry] of Object.entries(prGroups)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new StateCorruptError(statePath, `entry "prGroups[${prKey}]" must be an object`);
+      }
+    }
+    base.prGroups = prGroups as Record<string, PrGroupRecord>;
+  }
 
   const processedEvents = assertStateMapField(statePath, obj.processedEvents, 'processedEvents');
-  base.processedEvents = toSafeStringRecord(processedEvents);
+  base.processedEvents = toSafeStringRecord(processedEvents, statePath, 'processedEvents');
 
   const processedDeliveries = assertStateMapField(
     statePath,
     obj.processedDeliveries,
     'processedDeliveries',
   );
-  base.processedDeliveries = toSafeStringRecord(processedDeliveries);
+  base.processedDeliveries = toSafeStringRecord(
+    processedDeliveries,
+    statePath,
+    'processedDeliveries',
+  );
 
   const rateLimits = assertStateMapField(statePath, obj.rateLimits, 'rateLimits');
   if (rateLimits) base.rateLimits = rateLimits as RateLimitState;
 
   const svcObj = assertStateMapField(statePath, obj.service, 'service');
   if (svcObj) {
+    if (
+      svcObj.mode !== undefined &&
+      svcObj.mode !== 'dormant' &&
+      svcObj.mode !== 'active' &&
+      svcObj.mode !== 'paused'
+    ) {
+      throw new StateCorruptError(statePath, `invalid service.mode: ${String(svcObj.mode)}`);
+    }
+    if (
+      svcObj.activeRepoCount !== undefined &&
+      (typeof svcObj.activeRepoCount !== 'number' || !Number.isInteger(svcObj.activeRepoCount))
+    ) {
+      throw new StateCorruptError(statePath, 'service.activeRepoCount must be an integer');
+    }
+    if (
+      svcObj.boundPort !== undefined &&
+      (typeof svcObj.boundPort !== 'number' || !Number.isInteger(svcObj.boundPort))
+    ) {
+      throw new StateCorruptError(statePath, 'service.boundPort must be an integer');
+    }
+    if (
+      svcObj.pid !== undefined &&
+      (typeof svcObj.pid !== 'number' || !Number.isInteger(svcObj.pid))
+    ) {
+      throw new StateCorruptError(statePath, 'service.pid must be an integer');
+    }
+    for (const strKey of ['startedAt', 'lastHeartbeatAt', 'lastReloadAt'] as const) {
+      if (svcObj[strKey] !== undefined && typeof svcObj[strKey] !== 'string') {
+        throw new StateCorruptError(statePath, `service.${strKey} must be a string`);
+      }
+    }
     const svc = svcObj as Partial<PluginState['service']>;
     base.service = {
-      mode: svc.mode === 'active' || svc.mode === 'paused' ? svc.mode : 'dormant',
-      activeRepoCount: typeof svc.activeRepoCount === 'number' ? svc.activeRepoCount : 0,
-      ...(typeof svc.boundPort === 'number' && Number.isInteger(svc.boundPort)
-        ? { boundPort: svc.boundPort }
-        : {}),
-      ...(typeof svc.pid === 'number' && Number.isInteger(svc.pid) ? { pid: svc.pid } : {}),
-      ...(typeof svc.startedAt === 'string' ? { startedAt: svc.startedAt } : {}),
-      ...(typeof svc.lastHeartbeatAt === 'string' ? { lastHeartbeatAt: svc.lastHeartbeatAt } : {}),
-      ...(typeof svc.lastReloadAt === 'string' ? { lastReloadAt: svc.lastReloadAt } : {}),
+      mode: svc.mode ?? 'dormant',
+      activeRepoCount: svc.activeRepoCount ?? 0,
+      ...(svc.boundPort !== undefined ? { boundPort: svc.boundPort } : {}),
+      ...(svc.pid !== undefined ? { pid: svc.pid } : {}),
+      ...(svc.startedAt !== undefined ? { startedAt: svc.startedAt } : {}),
+      ...(svc.lastHeartbeatAt !== undefined ? { lastHeartbeatAt: svc.lastHeartbeatAt } : {}),
+      ...(svc.lastReloadAt !== undefined ? { lastReloadAt: svc.lastReloadAt } : {}),
     };
   }
   return base;

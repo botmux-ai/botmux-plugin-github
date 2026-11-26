@@ -927,7 +927,7 @@ describe('PR #1 Round-2 Independent Review Regressions (5x P1, 7x P2, 1x P3)', (
             return {
               exitCode: 1,
               stdout: '',
-              stderr: 'Error: working-dir path does not exist; chat.create not called\n',
+              stderr: '--working-dir Directory does not exist: /definitely-absent\n',
             };
           }
           return {

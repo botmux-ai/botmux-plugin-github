@@ -92,12 +92,20 @@ export function normalizeRepoKey(repo: string): string {
   return repo.trim().toLowerCase();
 }
 
-function normalizeStringArray(raw: unknown): string[] {
-  if (!Array.isArray(raw)) return [];
+function assertOptionalStringArray(raw: unknown, fieldName: string): string[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be an array of strings`);
+  }
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const item of raw) {
-    if (typeof item !== 'string') continue;
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (typeof item !== 'string') {
+      throw new ConfigValidationError(
+        `Config field "${fieldName}[${i}]" must be a string`,
+      );
+    }
     const trimmed = item.trim();
     if (!trimmed) continue;
     if (!seen.has(trimmed)) {
@@ -108,17 +116,61 @@ function normalizeStringArray(raw: unknown): string[] {
   return out;
 }
 
-function normalizeTriggerOn(raw: unknown): TriggerKind[] {
-  if (!Array.isArray(raw) || raw.length === 0) {
+function assertOptionalBoolean(raw: unknown, fieldName: string, defaultValue: boolean): boolean {
+  if (raw === undefined) return defaultValue;
+  if (typeof raw !== 'boolean') {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be a boolean`);
+  }
+  return raw;
+}
+
+function assertOptionalTriggerOn(raw: unknown, fieldName: string): TriggerKind[] {
+  if (raw === undefined) {
     return ['opened', 'ready_for_review'];
   }
-  const out: TriggerKind[] = [];
-  for (const item of raw) {
-    if (item === 'opened' || item === 'ready_for_review') {
-      if (!out.includes(item)) out.push(item);
-    }
+  if (!Array.isArray(raw)) {
+    throw new ConfigValidationError(
+      `Config field "${fieldName}" must be an array of "opened" | "ready_for_review"`,
+    );
   }
-  return out.length > 0 ? out : ['opened', 'ready_for_review'];
+  if (raw.length === 0) {
+    throw new ConfigValidationError(`Config field "${fieldName}" must not be empty`);
+  }
+  const out: TriggerKind[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const item = raw[i];
+    if (item !== 'opened' && item !== 'ready_for_review') {
+      throw new ConfigValidationError(
+        `Config field "${fieldName}[${i}]" must be "opened" or "ready_for_review"`,
+      );
+    }
+    if (!out.includes(item)) out.push(item);
+  }
+  return out;
+}
+
+function assertOptionalChatMode(raw: unknown, fieldName: string): ChatMode {
+  if (raw === undefined) return 'group';
+  if (raw !== 'group' && raw !== 'topic') {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be "group" or "topic"`);
+  }
+  return raw;
+}
+
+function assertOptionalIntField(
+  raw: unknown,
+  fieldName: string,
+  min: number,
+  max: number,
+  defaultValue: number,
+): number {
+  if (raw === undefined) return defaultValue;
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < min || raw > max) {
+    throw new ConfigValidationError(
+      `Config field "${fieldName}" must be an integer between ${min} and ${max}`,
+    );
+  }
+  return raw;
 }
 
 function validatePrivateKeyPem(pem: string): void {
@@ -138,17 +190,26 @@ function validatePrivateKeyPem(pem: string): void {
 }
 
 export function validateRepoRule(raw: Partial<RepoRule>, index: number): RepoRule {
-  if (!raw || typeof raw !== 'object') {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigValidationError(`Repo rule #${index + 1} must be an object`);
   }
-  const repo = validateRepoSlug(String(raw.repo ?? ''));
-  const enabled = raw.enabled === true;
-  const creatorBotAppId = typeof raw.creatorBotAppId === 'string' ? raw.creatorBotAppId.trim() : '';
-  const kickoffBotAppId =
-    typeof raw.kickoffBotAppId === 'string' && raw.kickoffBotAppId.trim()
-      ? raw.kickoffBotAppId.trim()
-      : undefined;
-  const memberBotAppIds = normalizeStringArray(raw.memberBotAppIds);
+  const prefix = `repos[${index}]`;
+  if (typeof raw.repo !== 'string') {
+    throw new ConfigValidationError(`Config field "${prefix}.repo" must be a string`);
+  }
+  const repo = validateRepoSlug(raw.repo);
+  const enabled = assertOptionalBoolean(raw.enabled, `${prefix}.enabled`, false);
+
+  const creatorField = assertOptionalStringField(raw.creatorBotAppId, `${prefix}.creatorBotAppId`);
+  const creatorBotAppId = creatorField ? creatorField.trim() : '';
+
+  const kickoffField = assertOptionalStringField(raw.kickoffBotAppId, `${prefix}.kickoffBotAppId`);
+  const kickoffBotAppId = kickoffField && kickoffField.trim() ? kickoffField.trim() : undefined;
+
+  const memberBotAppIds = assertOptionalStringArray(
+    raw.memberBotAppIds,
+    `${prefix}.memberBotAppIds`,
+  );
 
   if (enabled) {
     if (!creatorBotAppId) {
@@ -186,19 +247,27 @@ export function validateRepoRule(raw: Partial<RepoRule>, index: number): RepoRul
     }
   }
 
-  const chatMode: ChatMode = raw.chatMode === 'topic' ? 'topic' : 'group';
+  const chatMode = assertOptionalChatMode(raw.chatMode, `${prefix}.chatMode`);
+  const groupTplField = assertOptionalStringField(
+    raw.groupNameTemplate,
+    `${prefix}.groupNameTemplate`,
+  );
   const groupNameTemplate =
-    typeof raw.groupNameTemplate === 'string' && raw.groupNameTemplate.trim()
-      ? raw.groupNameTemplate.trim()
-      : DEFAULT_GROUP_NAME_TEMPLATE;
+    groupTplField && groupTplField.trim() ? groupTplField.trim() : DEFAULT_GROUP_NAME_TEMPLATE;
+
+  const kickoffTplField = assertOptionalStringField(
+    raw.kickoffPromptTemplate,
+    `${prefix}.kickoffPromptTemplate`,
+  );
   const kickoffPromptTemplate =
-    typeof raw.kickoffPromptTemplate === 'string' && raw.kickoffPromptTemplate.trim()
-      ? raw.kickoffPromptTemplate.trim()
+    kickoffTplField && kickoffTplField.trim()
+      ? kickoffTplField.trim()
       : DEFAULT_KICKOFF_PROMPT_TEMPLATE;
 
+  const bindDirField = assertOptionalStringField(raw.bindWorkingDir, `${prefix}.bindWorkingDir`);
   let bindWorkingDir: string | undefined;
-  if (typeof raw.bindWorkingDir === 'string' && raw.bindWorkingDir.trim()) {
-    const dir = raw.bindWorkingDir.trim();
+  if (bindDirField && bindDirField.trim()) {
+    const dir = bindDirField.trim();
     if (dir.includes('\0') || !dir.startsWith('/')) {
       throw new ConfigValidationError(
         `Repo "${repo}": bindWorkingDir must be an absolute path without NUL bytes`,
@@ -208,32 +277,34 @@ export function validateRepoRule(raw: Partial<RepoRule>, index: number): RepoRul
   }
 
   let pollIntervalSec: number | undefined;
-  if (raw.pollIntervalSec !== undefined && raw.pollIntervalSec !== null) {
-    const n = Number(raw.pollIntervalSec);
-    if (!Number.isInteger(n) || n < MIN_POLL_INTERVAL_SEC || n > 86_400) {
+  if (raw.pollIntervalSec !== undefined) {
+    if (
+      typeof raw.pollIntervalSec !== 'number' ||
+      !Number.isInteger(raw.pollIntervalSec) ||
+      raw.pollIntervalSec < MIN_POLL_INTERVAL_SEC ||
+      raw.pollIntervalSec > 86_400
+    ) {
       throw new ConfigValidationError(
         `Repo "${repo}": pollIntervalSec must be an integer between ${MIN_POLL_INTERVAL_SEC} and 86400`,
       );
     }
-    pollIntervalSec = n;
+    pollIntervalSec = raw.pollIntervalSec;
   }
 
-  const id =
-    typeof raw.id === 'string' && raw.id.trim()
-      ? raw.id.trim()
-      : normalizeRepoKey(repo);
+  const idField = assertOptionalStringField(raw.id, `${prefix}.id`);
+  const id = idField && idField.trim() ? idField.trim() : normalizeRepoKey(repo);
 
   return {
     id,
     repo,
     enabled,
-    baseBranches: normalizeStringArray(raw.baseBranches),
-    triggerOn: normalizeTriggerOn(raw.triggerOn),
-    ignoreDrafts: raw.ignoreDrafts !== false,
-    authorAllowlist: normalizeStringArray(raw.authorAllowlist),
-    authorDenylist: normalizeStringArray(raw.authorDenylist),
-    labelAllowlist: normalizeStringArray(raw.labelAllowlist),
-    labelDenylist: normalizeStringArray(raw.labelDenylist),
+    baseBranches: assertOptionalStringArray(raw.baseBranches, `${prefix}.baseBranches`),
+    triggerOn: assertOptionalTriggerOn(raw.triggerOn, `${prefix}.triggerOn`),
+    ignoreDrafts: assertOptionalBoolean(raw.ignoreDrafts, `${prefix}.ignoreDrafts`, true),
+    authorAllowlist: assertOptionalStringArray(raw.authorAllowlist, `${prefix}.authorAllowlist`),
+    authorDenylist: assertOptionalStringArray(raw.authorDenylist, `${prefix}.authorDenylist`),
+    labelAllowlist: assertOptionalStringArray(raw.labelAllowlist, `${prefix}.labelAllowlist`),
+    labelDenylist: assertOptionalStringArray(raw.labelDenylist, `${prefix}.labelDenylist`),
     creatorBotAppId,
     memberBotAppIds,
     ...(kickoffBotAppId ? { kickoffBotAppId } : {}),
@@ -241,10 +312,14 @@ export function validateRepoRule(raw: Partial<RepoRule>, index: number): RepoRul
     groupNameTemplate,
     kickoffPromptTemplate,
     ...(bindWorkingDir ? { bindWorkingDir } : {}),
-    setTopNotice: raw.setTopNotice !== false,
-    postShareLinkToPr: raw.postShareLinkToPr === true,
-    onNewCommit: raw.onNewCommit === true,
-    onPrClosed: raw.onPrClosed === true,
+    setTopNotice: assertOptionalBoolean(raw.setTopNotice, `${prefix}.setTopNotice`, true),
+    postShareLinkToPr: assertOptionalBoolean(
+      raw.postShareLinkToPr,
+      `${prefix}.postShareLinkToPr`,
+      false,
+    ),
+    onNewCommit: assertOptionalBoolean(raw.onNewCommit, `${prefix}.onNewCommit`, false),
+    onPrClosed: assertOptionalBoolean(raw.onPrClosed, `${prefix}.onPrClosed`, false),
     ...(pollIntervalSec !== undefined ? { pollIntervalSec } : {}),
   };
 }
@@ -284,6 +359,9 @@ export function normalizeAndValidateConfig(
     throw new ConfigValidationError('Configuration root must be a JSON object');
   }
   const obj = raw as Record<string, unknown>;
+  if (obj.schemaVersion !== undefined && obj.schemaVersion !== 1) {
+    throw new ConfigValidationError(`Unsupported config schemaVersion: ${String(obj.schemaVersion)}`);
+  }
   const rawGh = assertOptionalPlainObject(obj.github, 'github');
   const rawApp = assertOptionalPlainObject(rawGh.app, 'github.app');
   const rawProxy = assertOptionalPlainObject(obj.proxy, 'proxy');
@@ -352,41 +430,35 @@ export function normalizeAndValidateConfig(
   const webhookSecret =
     whSecretField && whSecretField.trim() ? whSecretField.trim() : undefined;
   const whPathField = assertOptionalStringField(rawWebhook.path, 'webhook.path');
-  const webhookPath =
-    whPathField && whPathField.trim().startsWith('/')
-      ? whPathField.trim()
-      : DEFAULT_WEBHOOK_PATH;
+  let webhookPath = DEFAULT_WEBHOOK_PATH;
+  if (whPathField !== undefined && whPathField.trim()) {
+    const trimmedPath = whPathField.trim();
+    if (!trimmedPath.startsWith('/')) {
+      throw new ConfigValidationError('Config field "webhook.path" must start with "/"');
+    }
+    webhookPath = trimmedPath;
+  }
   if (webhookEnabled && !isWebhookSecretAcceptable(webhookSecret)) {
     throw new ConfigValidationError(
       `Webhook requires a secret of at least ${MIN_WEBHOOK_SECRET_BYTES} UTF-8 bytes with at least 8 distinct characters`,
     );
   }
 
-  const port =
-    rawService.port !== undefined ? Number(rawService.port) : DEFAULT_SERVICE_PORT;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new ConfigValidationError('service.port must be an integer between 1 and 65535');
-  }
-
-  const pollIntervalSec =
-    rawService.pollIntervalSec !== undefined
-      ? Number(rawService.pollIntervalSec)
-      : DEFAULT_POLL_INTERVAL_SEC;
-  if (!Number.isInteger(pollIntervalSec) || pollIntervalSec < MIN_POLL_INTERVAL_SEC || pollIntervalSec > 86_400) {
-    throw new ConfigValidationError(
-      `service.pollIntervalSec must be an integer between ${MIN_POLL_INTERVAL_SEC} and 86400`,
-    );
-  }
-
-  const maxCreates =
-    rawService.maxGroupCreatesPerRepoPerHour !== undefined
-      ? Number(rawService.maxGroupCreatesPerRepoPerHour)
-      : DEFAULT_MAX_GROUP_CREATES_PER_HOUR;
-  if (!Number.isInteger(maxCreates) || maxCreates < 1 || maxCreates > 1000) {
-    throw new ConfigValidationError(
-      'service.maxGroupCreatesPerRepoPerHour must be an integer between 1 and 1000',
-    );
-  }
+  const port = assertOptionalIntField(rawService.port, 'service.port', 1, 65535, DEFAULT_SERVICE_PORT);
+  const pollIntervalSec = assertOptionalIntField(
+    rawService.pollIntervalSec,
+    'service.pollIntervalSec',
+    MIN_POLL_INTERVAL_SEC,
+    86_400,
+    DEFAULT_POLL_INTERVAL_SEC,
+  );
+  const maxCreates = assertOptionalIntField(
+    rawService.maxGroupCreatesPerRepoPerHour,
+    'service.maxGroupCreatesPerRepoPerHour',
+    1,
+    1000,
+    DEFAULT_MAX_GROUP_CREATES_PER_HOUR,
+  );
 
   if (obj.repos !== undefined && !Array.isArray(obj.repos)) {
     throw new ConfigValidationError('Config field "repos" must be an array');
@@ -511,24 +583,38 @@ export function redactConfig(cfg: PluginConfig): RedactedPluginConfig {
 
 function resolveSecretPatch(
   existing: string | undefined,
-  incoming: string | SecretPatch | undefined,
-  clearFlag: boolean | undefined,
+  incoming: unknown,
+  clearFlag: unknown,
   fieldName: string,
 ): string | undefined {
-  if (clearFlag === true) return undefined;
-  if (incoming === undefined || incoming === null) return existing;
+  const clear = assertOptionalBoolean(clearFlag, `${fieldName} clear flag`, false);
+  if (clear) return undefined;
+  if (incoming === undefined) return existing;
+  if (incoming === null) {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be a string or secret patch object`);
+  }
   if (typeof incoming === 'object') {
-    if (incoming.action === 'clear') return undefined;
-    if (incoming.action === 'keep') return existing;
-    if (incoming.action === 'set') {
-      const val = typeof incoming.value === 'string' ? incoming.value.trim() : '';
+    if (Array.isArray(incoming)) {
+      throw new ConfigValidationError(`Config field "${fieldName}" must not be an array`);
+    }
+    const obj = incoming as Record<string, unknown>;
+    if (obj.action === 'clear') return undefined;
+    if (obj.action === 'keep') return existing;
+    if (obj.action === 'set') {
+      if (typeof obj.value !== 'string') {
+        throw new ConfigValidationError(`Config field "${fieldName}.value" must be a string`);
+      }
+      const val = obj.value.trim();
       if (!val) return existing;
       if (MASK_SENTINEL_RE.test(val)) {
         throw new ConfigValidationError(`Refused masked placeholder for ${fieldName}`);
       }
       return val;
     }
-    return existing;
+    throw new ConfigValidationError(`Invalid secret patch action for "${fieldName}"`);
+  }
+  if (typeof incoming !== 'string') {
+    throw new ConfigValidationError(`Config field "${fieldName}" must be a string`);
   }
   const trimmed = incoming.trim();
   if (!trimmed) return existing;
@@ -556,6 +642,7 @@ export function apiOriginChanged(currentApiBaseUrl: string, nextApiBaseUrl: stri
 
 /**
  * Merges a partial write-only settings patch into an existing PluginConfig:
+ * - Strictly rejects wrong-typed or null patch sections/fields (never silently coerces!)
  * - Preserves stored secrets when omitted or empty
  * - Rejects masked placeholders (e.g. "***", "[REDACTED]")
  * - Clears secrets on explicit clear flag or { action: 'clear' }
@@ -567,31 +654,47 @@ export function applyConfigPatch(
   patch: PluginConfigPatch,
   opts?: { allowInsecureLocalApiForTests?: boolean },
 ): PluginConfig {
-  const nextApiBaseUrl = patch.github?.apiBaseUrl ?? current.github.apiBaseUrl;
-  const ghOriginChanged = apiOriginChanged(current.github.apiBaseUrl, patch.github?.apiBaseUrl);
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+    throw new ConfigValidationError('Config patch must be a JSON object');
+  }
+  const pObj = patch as Record<string, unknown>;
+  if (pObj.schemaVersion !== undefined && pObj.schemaVersion !== 1) {
+    throw new ConfigValidationError(`Unsupported config schemaVersion: ${String(pObj.schemaVersion)}`);
+  }
+
+  const pGh = assertOptionalPlainObject(pObj.github, 'github');
+  const pApp = assertOptionalPlainObject(pGh.app, 'github.app');
+  const pProxy = assertOptionalPlainObject(pObj.proxy, 'proxy');
+  const pWebhook = assertOptionalPlainObject(pObj.webhook, 'webhook');
+  const pService = assertOptionalPlainObject(pObj.service, 'service');
+
+  const patchApiBaseUrl = assertOptionalStringField(pGh.apiBaseUrl, 'github.apiBaseUrl');
+  const nextApiBaseUrl = patchApiBaseUrl !== undefined ? patchApiBaseUrl : current.github.apiBaseUrl;
+  const ghOriginChanged = apiOriginChanged(current.github.apiBaseUrl, patchApiBaseUrl);
 
   const nextPat = resolveSecretPatch(
     ghOriginChanged ? undefined : current.github.pat,
-    patch.github?.pat,
-    patch.github?.clearPat,
+    pGh.pat,
+    pGh.clearPat,
     'github.pat',
   );
   const nextPrivateKey = resolveSecretPatch(
     ghOriginChanged ? undefined : current.github.app.privateKeyPem,
-    patch.github?.app?.privateKeyPem,
-    patch.github?.app?.clearPrivateKey,
+    pApp.privateKeyPem,
+    pApp.clearPrivateKey,
     'github.app.privateKeyPem',
   );
   const nextWebhookSecret = resolveSecretPatch(
     current.webhook.secret,
-    patch.webhook?.secret,
-    patch.webhook?.clearSecret,
+    pWebhook.secret,
+    pWebhook.clearSecret,
     'webhook.secret',
   );
 
   // Validate incoming proxy.url fail-closed BEFORE stripping embedded credentials!
-  const urlProvidedInPatch = patch.proxy?.url !== undefined;
-  const nextProxyUrlRaw = urlProvidedInPatch ? patch.proxy!.url!.trim() : current.proxy.url;
+  const patchProxyUrl = assertOptionalStringField(pProxy.url, 'proxy.url');
+  const urlProvidedInPatch = patchProxyUrl !== undefined;
+  const nextProxyUrlRaw = urlProvidedInPatch ? patchProxyUrl.trim() : current.proxy.url;
   const proxyTargetChanged =
     normalizedOriginKey(nextProxyUrlRaw) !== normalizedOriginKey(current.proxy.url);
 
@@ -604,7 +707,6 @@ export function applyConfigPatch(
       throw new ConfigValidationError(precheck.error.message);
     }
     const parsed = new URL(nextProxyUrlRaw);
-    // Only treat embedded userinfo as incoming patch overrides when patch.proxy.url was explicitly supplied!
     if (urlProvidedInPatch) {
       if (parsed.username) embeddedUser = decodeURIComponent(parsed.username);
       if (parsed.password) {
@@ -615,7 +717,6 @@ export function applyConfigPatch(
         embeddedPass = dec;
       }
     }
-    // Always strip embedded credentials from stored proxy.url; credentials live in proxy.username/proxy.password.
     if (parsed.username || parsed.password) {
       const host = formatHostForUrl(parsed.hostname);
       const portPart = parsed.port ? `:${parsed.port}` : '';
@@ -623,9 +724,6 @@ export function applyConfigPatch(
     }
   }
 
-  // Migrate any userinfo credentials currently stored inside current.proxy.url so
-  // saving redacted Dashboard settings NEVER silently drops existing proxy auth,
-  // while partial patches like { proxy: { clearPassword: true } } or { proxy: { username: 'bob' } } still work!
   const currentUrlInfo = extractProxyUrlUserinfo(current.proxy.url);
   const existingProxyUsername = current.proxy.username || currentUrlInfo.username;
   const existingProxyPassword = current.proxy.password || currentUrlInfo.password;
@@ -635,12 +733,12 @@ export function applyConfigPatch(
     ? embeddedPass
     : resolveSecretPatch(
         basePasswordForMerge,
-        patch.proxy?.password,
-        patch.proxy?.clearPassword,
+        pProxy.password,
+        pProxy.clearPassword,
         'proxy.password',
       );
-  const explicitUsername =
-    patch.proxy?.username !== undefined ? patch.proxy.username.trim() : undefined;
+  const patchProxyUsername = assertOptionalStringField(pProxy.username, 'proxy.username');
+  const explicitUsername = patchProxyUsername !== undefined ? patchProxyUsername.trim() : undefined;
   const nextProxyUsername =
     embeddedUser !== undefined
       ? embeddedUser
@@ -648,27 +746,32 @@ export function applyConfigPatch(
         ? explicitUsername || undefined
         : explicitUsername
           ? explicitUsername
-          : patch.proxy?.username === '' && current.proxy.username !== undefined
+          : patchProxyUsername === '' && current.proxy.username !== undefined
             ? undefined
             : existingProxyUsername;
 
+  const patchGhHostname = assertOptionalStringField(pGh.ghHostname, 'github.ghHostname');
+
+  // Use explicit `!== undefined` (NOT `??`) so explicit `null` values propagate and fail closed!
   const merged = {
     schemaVersion: 1 as const,
     github: {
-      mode: patch.github?.mode ?? current.github.mode,
+      mode: pGh.mode !== undefined ? pGh.mode : current.github.mode,
       apiBaseUrl: nextApiBaseUrl,
       ...(nextPat ? { pat: nextPat } : {}),
-      ...(patch.github?.ghHostname !== undefined
-        ? patch.github.ghHostname.trim()
-          ? { ghHostname: patch.github.ghHostname.trim() }
+      ...(patchGhHostname !== undefined
+        ? patchGhHostname.trim()
+          ? { ghHostname: patchGhHostname.trim() }
           : {}
         : current.github.ghHostname
           ? { ghHostname: current.github.ghHostname }
           : {}),
       app: {
-        appId: patch.github?.app?.appId ?? current.github.app.appId,
+        appId: pApp.appId !== undefined ? pApp.appId : current.github.app.appId,
         installationId:
-          patch.github?.app?.installationId ?? current.github.app.installationId,
+          pApp.installationId !== undefined
+            ? pApp.installationId
+            : current.github.app.installationId,
         ...(nextPrivateKey ? { privateKeyPem: nextPrivateKey } : {}),
       },
     },
@@ -678,18 +781,25 @@ export function applyConfigPatch(
       ...(nextProxyUrl && nextProxyPassword ? { password: nextProxyPassword } : {}),
     },
     webhook: {
-      enabled: patch.webhook?.enabled ?? current.webhook.enabled,
+      enabled: pWebhook.enabled !== undefined ? pWebhook.enabled : current.webhook.enabled,
       ...(nextWebhookSecret ? { secret: nextWebhookSecret } : {}),
-      path: patch.webhook?.path ?? current.webhook.path ?? DEFAULT_WEBHOOK_PATH,
+      path:
+        pWebhook.path !== undefined
+          ? pWebhook.path
+          : (current.webhook.path ?? DEFAULT_WEBHOOK_PATH),
     },
     service: {
-      port: patch.service?.port ?? current.service.port,
-      pollIntervalSec: patch.service?.pollIntervalSec ?? current.service.pollIntervalSec,
+      port: pService.port !== undefined ? pService.port : current.service.port,
+      pollIntervalSec:
+        pService.pollIntervalSec !== undefined
+          ? pService.pollIntervalSec
+          : current.service.pollIntervalSec,
       maxGroupCreatesPerRepoPerHour:
-        patch.service?.maxGroupCreatesPerRepoPerHour ??
-        current.service.maxGroupCreatesPerRepoPerHour,
+        pService.maxGroupCreatesPerRepoPerHour !== undefined
+          ? pService.maxGroupCreatesPerRepoPerHour
+          : current.service.maxGroupCreatesPerRepoPerHour,
     },
-    repos: patch.repos !== undefined ? patch.repos : current.repos,
+    repos: pObj.repos !== undefined ? pObj.repos : current.repos,
   };
 
   return normalizeAndValidateConfig(merged, opts);
