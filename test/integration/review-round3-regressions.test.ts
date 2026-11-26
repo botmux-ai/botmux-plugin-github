@@ -12,6 +12,7 @@ import { applyConfigPatch, createDefaultConfig } from '../../src/config/schema.t
 import { savePluginConfig } from '../../src/config/store.ts';
 import { StateStore, StateCorruptError } from '../../src/state/store.ts';
 import { GitHubClient } from '../../src/github/client.ts';
+import { GitHubWatcher } from '../../src/engine/watcher.ts';
 import { HostBridge } from '../../src/host/bridge.ts';
 import { startGitHubService } from '../../src/service/runner.ts';
 import { acquireSecureLock, readDurableProcessIdentity, SecurityFsError } from '../../src/security/fs.ts';
@@ -621,6 +622,323 @@ describe('PR #1 Round-3 Independent Review Boundary Regressions (2x P1, 4x P2)',
         new Promise<void>(r => ghServer.close(() => r())),
       ]);
       await fsp.rm(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PR #1 Round-4 Pagination 304 Link-Transition Regressions', () => {
+  it('[R4 P1] 2->1 shrink via page-1 304 with explicit terminal Link reconciles closed PR #101 in watcher and returns steady-state 304 afterward', async () => {
+    const tmp = await fsp.mkdtemp(join(tmpdir(), 'botmux-r4-2to1-'));
+    const pluginHome = join(tmp, 'plugin');
+    const botmuxHome = join(tmp, 'botmux');
+    const dataDir = join(tmp, 'data');
+    const daemonsDir = join(dataDir, 'dashboard-daemons');
+    await fsp.mkdir(daemonsDir, { recursive: true, mode: 0o700 });
+    await fsp.mkdir(botmuxHome, { recursive: true, mode: 0o700 });
+    const dashSecret = 'k'.repeat(43);
+    await fsp.writeFile(join(botmuxHome, '.dashboard-secret'), `${dashSecret}\n`, { mode: 0o600 });
+    await fsp.writeFile(join(botmuxHome, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_creator1', larkAppSecret: 's1', brand: 'feishu' }]), { mode: 0o600 });
+
+    const page1Prs = Array.from({ length: 100 }, (_, i) => makeRawPr(i + 1, 'acme/r3', 'open'));
+    let pr101Open = true;
+    let page1Calls = 0;
+    let page2Calls = 0;
+    let page1TerminalLinkHeader = '<http://127.0.0.1/pulls?page=1>; rel="first"';
+    let closeMessagesSent = 0;
+
+    const ghServer = http.createServer((req, res) => {
+      if (req.url?.includes('&page=1')) {
+        page1Calls++;
+        if (req.headers['if-none-match'] === '"r4-p1"') {
+          const headers: Record<string, string> = { ETag: '"r4-p1"' };
+          if (pr101Open) {
+            headers.Link = '<http://127.0.0.1/pulls?page=2>; rel="next"';
+          } else if (page1TerminalLinkHeader) {
+            headers.Link = page1TerminalLinkHeader;
+          }
+          res.writeHead(304, headers);
+          res.end();
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          ETag: '"r4-p1"',
+          ...(pr101Open ? { Link: '<http://127.0.0.1/pulls?page=2>; rel="next"' } : {}),
+        });
+        res.end(JSON.stringify(page1Prs));
+        return;
+      }
+      if (req.url?.includes('&page=2')) {
+        page2Calls++;
+        res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"r4-p2"' });
+        res.end(JSON.stringify(pr101Open ? [makeRawPr(101, 'acme/r3', 'open')] : []));
+        return;
+      }
+      if (req.url === '/repos/acme/r3/pulls/101') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(makeRawPr(101, 'acme/r3', pr101Open ? 'open' : 'closed')));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+
+    let daemonPort = 0;
+    const seenNonces = new Map<string, number>();
+    const daemonServer = http.createServer((req, res) => {
+      verifyDaemonIpcHeaders(req.headers, dashSecret, req.method ?? 'GET', req.url ?? '/', daemonPort, seenNonces);
+      const chunks: Buffer[] = [];
+      req.on('data', c => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+      req.on('end', () => {
+        const body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+        if (req.method === 'POST' && req.url === '/api/groups/oc_r4_101/messages') {
+          closeMessagesSent++;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, chatId: 'oc_r4_101', messageId: 'om_r4_cl101', requestId: body.requestId, replayed: false }));
+          return;
+        }
+        res.writeHead(404);
+        res.end('{}');
+      });
+    });
+
+    await Promise.all([
+      new Promise<void>(r => ghServer.listen(0, '127.0.0.1', () => r())),
+      new Promise<void>(r => daemonServer.listen(0, '127.0.0.1', () => r())),
+    ]);
+    const ghPort = (ghServer.address() as { port: number }).port;
+    daemonPort = (daemonServer.address() as { port: number }).port;
+    await fsp.writeFile(
+      join(daemonsDir, 'cli_creator1.json'),
+      JSON.stringify({ larkAppId: 'cli_creator1', ipcPort: daemonPort, lastHeartbeat: Date.now(), resolvedAllowedUsers: [] }),
+      { mode: 0o600 },
+    );
+
+    try {
+      const stateStore = new StateStore(pluginHome);
+      await stateStore.update(s => {
+        s.prGroups['acme/r3#101'] = {
+          status: 'active',
+          repo: 'acme/r3',
+          prNumber: 101,
+          chatId: 'oc_r4_101',
+          groupName: 'PR #101 acme/r3',
+          creatorLarkAppId: 'cli_creator1',
+          kickoffMessageId: 'om_k101',
+          kickoffVerified: true,
+          topNoticeSet: true,
+          lifecycleGeneration: 1,
+          lastHeadSha: 'a'.repeat(40),
+          createdAt: '2026-11-26T00:00:00Z',
+          updatedAt: '2026-11-26T00:00:00Z',
+        };
+      });
+
+      const cfg = applyConfigPatch(
+        createDefaultConfig(),
+        {
+          github: { mode: 'pat', apiBaseUrl: `http://127.0.0.1:${ghPort}`, pat: 'github_pat_r4_2to1_1234567890abcdef' },
+          repos: [makeRule({ onPrClosed: true })],
+        },
+        { allowInsecureLocalApiForTests: true },
+      );
+      const watcher = new GitHubWatcher({ config: cfg, stateStore, discovery: { botmuxHome, dataDir }, allowInsecureLocalApiForTests: true });
+
+      // Poll 1: baseline captures 101 open PRs across 2 pages (non-truncated!)
+      const poll1 = await watcher.sync();
+      assert.equal(poll1.actions[0]?.action, 'baseline_captured');
+      assert.equal((await stateStore.load()).repos['acme/r3']?.lastPageCount, 2);
+      assert.equal(page1Calls, 1);
+      assert.equal(page2Calls, 1);
+
+      // PR #101 closes -> Poll 2 gets page-1 304 with explicit terminal Link (rel="first")!
+      // Must NOT return skip_not_modified; must reconcile PR #101 closed and evict page 2!
+      pr101Open = false;
+      const poll2 = await watcher.sync();
+      assert.equal(poll2.ok, true);
+      assert.ok(poll2.actions.some(a => a.prNumber === 101 && a.action === 'notify_pr_closed'));
+      assert.equal(closeMessagesSent, 1);
+      const stAfterClose = await stateStore.load();
+      assert.equal(stAfterClose.prGroups['acme/r3#101']?.status, 'closed');
+      assert.equal(stAfterClose.repos['acme/r3']?.knownPrs['101']?.state, 'closed');
+      assert.equal(stAfterClose.repos['acme/r3']?.lastPageCount, 1);
+
+      // Poll 3 (steady-state with terminal Link) & Poll 4 (steady-state with no Link) -> both return skip_not_modified with ZERO extra page-2 calls!
+      const poll3 = await watcher.sync();
+      assert.equal(poll3.actions[0]?.action, 'skip_not_modified');
+      page1TerminalLinkHeader = '';
+      const poll4 = await watcher.sync();
+      assert.equal(poll4.actions[0]?.action, 'skip_not_modified');
+      assert.equal(page1Calls, 4);
+      assert.equal(page2Calls, 1, 'Steady-state polls after 2->1 shrink must NOT hit page 2');
+    } finally {
+      await Promise.all([
+        new Promise<void>(r => ghServer.close(() => r())),
+        new Promise<void>(r => daemonServer.close(() => r())),
+      ]);
+      await fsp.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('[R4 P1] handles 3->2 shrink via page-2 304 terminal Link, 3->1 shrink via page-1 304 terminal Link, and maxPages=1 capped->terminal transitions', async () => {
+    const page1Prs = Array.from({ length: 100 }, (_, i) => makeRawPr(i + 1));
+    const page2Prs = Array.from({ length: 100 }, (_, i) => makeRawPr(101 + i));
+    const page3Prs = [makeRawPr(201)];
+
+    let mode: '3pages' | '2pages_terminal' | '1page_terminal' | '1page_nolink' = '3pages';
+    let page3Calls = 0;
+
+    const ghServer = http.createServer((req, res) => {
+      if (req.url?.includes('&page=1')) {
+        if (req.headers['if-none-match'] === '"p1"') {
+          const headers: Record<string, string> = { ETag: '"p1"' };
+          if (mode === '3pages' || mode === '2pages_terminal') {
+            headers.Link = '<http://127.0.0.1/pulls?page=2>; rel="next"';
+          } else if (mode === '1page_terminal') {
+            headers.Link = '<http://127.0.0.1/pulls?page=1>; rel="first"';
+          }
+          res.writeHead(304, headers);
+          res.end();
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          ETag: '"p1"',
+          Link: '<http://127.0.0.1/pulls?page=2>; rel="next"',
+        });
+        res.end(JSON.stringify(page1Prs));
+        return;
+      }
+      if (req.url?.includes('&page=2')) {
+        if (req.headers['if-none-match'] === '"p2"') {
+          const headers: Record<string, string> = { ETag: '"p2"' };
+          if (mode === '3pages') {
+            headers.Link = '<http://127.0.0.1/pulls?page=3>; rel="next"';
+          } else {
+            headers.Link = '<http://127.0.0.1/pulls?page=1>; rel="prev"';
+          }
+          res.writeHead(304, headers);
+          res.end();
+          return;
+        }
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          ETag: '"p2"',
+          Link: '<http://127.0.0.1/pulls?page=3>; rel="next"',
+        });
+        res.end(JSON.stringify(page2Prs));
+        return;
+      }
+      if (req.url?.includes('&page=3')) {
+        page3Calls++;
+        res.writeHead(200, { 'Content-Type': 'application/json', ETag: '"p3"' });
+        res.end(JSON.stringify(page3Prs));
+        return;
+      }
+      res.writeHead(404);
+      res.end('{}');
+    });
+
+    await new Promise<void>(r => ghServer.listen(0, '127.0.0.1', () => r()));
+    const ghPort = (ghServer.address() as { port: number }).port;
+
+    try {
+      const client = new GitHubClient({
+        auth: { mode: 'pat', apiBaseUrl: `http://127.0.0.1:${ghPort}`, pat: 'github_pat_r4_3to2_1234567890abcdef', app: { appId: '', installationId: '' } },
+        allowInsecureLocalForTests: true,
+      });
+
+      // 1. 3 pages initial fetch (201 PRs)
+      const r1 = await client.listOpenPullRequests('acme', 'r3');
+      assert.equal(r1.pulls.length, 201);
+      assert.equal(r1.pageCount, 3);
+      assert.equal(r1.truncated, false);
+      assert.equal(page3Calls, 1);
+
+      // 2. Shrink 3->2 via page-2 304 with explicit terminal Link (rel="prev") -> MUST return notModified=false, pulls=200, pageCount=2!
+      mode = '2pages_terminal';
+      const r2 = await client.listOpenPullRequests('acme', 'r3', {
+        persistedEtag: r1.etag,
+        persistedEtagKey: r1.etagKey,
+        previousPageCount: r1.pageCount,
+        previousTruncated: r1.truncated,
+      });
+      assert.equal(r2.notModified, false);
+      assert.equal(r2.pulls.length, 200);
+      assert.equal(r2.pageCount, 2);
+      assert.equal(r2.truncated, false);
+      assert.equal(page3Calls, 1);
+
+      // 3. Steady-state 2 pages -> returns notModified=true, pageCount=2, zero page-3 calls!
+      const r3 = await client.listOpenPullRequests('acme', 'r3', {
+        persistedEtag: r2.etag,
+        persistedEtagKey: r2.etagKey,
+        previousPageCount: r2.pageCount,
+        previousTruncated: r2.truncated,
+      });
+      assert.equal(r3.notModified, true);
+      assert.equal(r3.pageCount, 2);
+      assert.equal(page3Calls, 1);
+
+      // 4. Shrink 2->1 via page-1 304 terminal Link -> returns notModified=false, pulls=100, pageCount=1!
+      mode = '1page_terminal';
+      const r4 = await client.listOpenPullRequests('acme', 'r3', {
+        persistedEtag: r3.etag,
+        persistedEtagKey: r3.etagKey,
+        previousPageCount: r3.pageCount,
+        previousTruncated: r3.truncated,
+      });
+      assert.equal(r4.notModified, false);
+      assert.equal(r4.pulls.length, 100);
+      assert.equal(r4.pageCount, 1);
+      assert.equal(r4.truncated, false);
+
+      // 5. Steady-state 1 page with no Link -> returns notModified=true, pageCount=1!
+      mode = '1page_nolink';
+      const r5 = await client.listOpenPullRequests('acme', 'r3', {
+        persistedEtag: r4.etag,
+        persistedEtagKey: r4.etagKey,
+        previousPageCount: r4.pageCount,
+        previousTruncated: r4.truncated,
+      });
+      assert.equal(r5.notModified, true);
+      assert.equal(r5.pageCount, 1);
+      assert.equal(r5.truncated, false);
+
+      // 6. Separate client testing maxPages=1 capped -> explicit terminal -> steady-state 304 (stays truncated=false)
+      mode = '3pages';
+      const cappedClient = new GitHubClient({
+        auth: { mode: 'pat', apiBaseUrl: `http://127.0.0.1:${ghPort}`, pat: 'github_pat_r4_cap1_1234567890abcdef', app: { appId: '', installationId: '' } },
+        allowInsecureLocalForTests: true,
+      });
+      const c1 = await cappedClient.listOpenPullRequests('acme', 'r3', { maxPages: 1 });
+      assert.equal(c1.pulls.length, 100);
+      assert.equal(c1.truncated, true);
+
+      mode = '1page_terminal';
+      const c2 = await cappedClient.listOpenPullRequests('acme', 'r3', {
+        maxPages: 1,
+        persistedEtag: c1.etag,
+        persistedEtagKey: c1.etagKey,
+        previousPageCount: c1.pageCount,
+        previousTruncated: c1.truncated,
+      });
+      assert.equal(c2.notModified, false);
+      assert.equal(c2.pulls.length, 100);
+      assert.equal(c2.truncated, false);
+
+      mode = '1page_nolink';
+      const c3 = await cappedClient.listOpenPullRequests('acme', 'r3', {
+        maxPages: 1,
+        persistedEtag: c2.etag,
+        persistedEtagKey: c2.etagKey,
+        previousPageCount: c2.pageCount,
+        previousTruncated: c2.truncated,
+      });
+      assert.equal(c3.notModified, true);
+      assert.equal(c3.truncated, false, 'Once verified_terminal, subsequent 304 without Link must stay truncated=false');
+    } finally {
+      await new Promise<void>(r => ghServer.close(() => r()));
     }
   });
 });
