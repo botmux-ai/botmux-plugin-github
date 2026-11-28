@@ -1,39 +1,165 @@
-name: Publish npm package
+name: Publish Release & npm Package
 
+# Triggered on v* tags pushed to main.
+# Runs two independent channels in parallel:
+# 1. release-github: publishes .tgz + .tgz.sha512 (SRI) as GitHub Release assets
+# 2. publish-npm: publishes @botmux-ai/plugin-github via npm OIDC Trusted Publishing
 on:
   push:
     tags:
       - 'v*'
 
-permissions:
-  contents: read
-  id-token: write
+permissions: {}
 
 jobs:
-  publish:
+  release-github:
+    name: GitHub Release (.tgz + .sha512)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Verify tag is on main and matches package.json version
         run: |
-          git fetch origin main --depth=50
-          git merge-base --is-ancestor "${GITHUB_SHA}" origin/main
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION="$(node -p "require('./package.json').version")"
-          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
-            echo "Tag version (${TAG_VERSION}) does not match package.json (${PKG_VERSION})"
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of origin/main"
             exit 1
           fi
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "v${PKG_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag (${GITHUB_REF_NAME}) does not match package.json version (v${PKG_VERSION})"
+            exit 1
+          fi
+          echo "Verified release tag ${GITHUB_REF_NAME} matches package.json (${PKG_VERSION})"
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build and test
+        run: npm test
+
+      - name: Pack tarball and generate SRI sha512
+        id: pack
+        run: |
+          rm -rf release-assets
+          mkdir -p release-assets
+          npm pack --pack-destination release-assets
+          node --input-type=module -e '
+            import fs from "node:fs";
+            import path from "node:path";
+            import crypto from "node:crypto";
+            import { execFileSync } from "node:child_process";
+
+            const dir = "release-assets";
+            const tgzFiles = fs.readdirSync(dir).filter(f => f.endsWith(".tgz"));
+            if (tgzFiles.length !== 1) {
+              throw new Error(`Expected exactly 1 .tgz in ${dir}, found ${tgzFiles.length}`);
+            }
+            const tgzName = tgzFiles[0];
+            const tgzPath = path.join(dir, tgzName);
+
+            const entries = execFileSync("tar", ["-tzf", tgzPath], { encoding: "utf8" })
+              .split(/\r?\n/)
+              .filter(Boolean);
+            if (!entries.includes("package/package.json")) {
+              throw new Error("Packed tarball is missing package/package.json");
+            }
+            if (!entries.some(e => e.startsWith("package/dist/"))) {
+              throw new Error("Packed tarball is missing package/dist/");
+            }
+
+            const bytes = fs.readFileSync(tgzPath);
+            const sri = `sha512-${crypto.createHash("sha512").update(bytes).digest("base64")}`;
+            if (!/^sha512-[A-Za-z0-9+/]{86}==$/.test(sri)) {
+              throw new Error(`Unexpected SRI sha512 format: ${sri}`);
+            }
+
+            const shaPath = `${tgzPath}.sha512`;
+            fs.writeFileSync(shaPath, `${sri}\n`, "utf8");
+            console.log(`Packed ${tgzName} (${bytes.length} bytes)`);
+            console.log(`Integrity: ${sri}`);
+
+            if (process.env.GITHUB_OUTPUT) {
+              fs.appendFileSync(
+                process.env.GITHUB_OUTPUT,
+                `tgz=${tgzPath}\nsha512=${shaPath}\n`,
+                "utf8",
+              );
+            }
+          '
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TGZ_FILE: ${{ steps.pack.outputs.tgz }}
+          SHA_FILE: ${{ steps.pack.outputs.sha512 }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists; uploading assets idempotently"
+            gh release upload "${GITHUB_REF_NAME}" "${TGZ_FILE}" "${SHA_FILE}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${TGZ_FILE}" "${SHA_FILE}" \
+              --title "${GITHUB_REF_NAME}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+  publish-npm:
+    name: Publish to npm (OIDC Trusted Publishing)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main and matches package.json version
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not an ancestor of origin/main"
+            exit 1
+          fi
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "v${PKG_VERSION}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag (${GITHUB_REF_NAME}) does not match package.json version (v${PKG_VERSION})"
+            exit 1
+          fi
+          echo "Verified release tag ${GITHUB_REF_NAME} matches package.json (${PKG_VERSION})"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
           cache: npm
 
-      - run: npm ci --no-audit --no-fund
-      - run: npm test
-      - run: npm publish --access public --provenance
+      - name: Upgrade npm for OIDC Trusted Publishing
+        # Node 22 ships npm 10.x which does not support OIDC token exchange.
+        run: |
+          npm install -g npm@^11.5.1
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build and test
+        run: npm test
+
+      - name: Publish to npm
+        # Uses npm Trusted Publishing (OIDC) without a long-lived NPM_TOKEN.
+        run: npm publish --access public --provenance

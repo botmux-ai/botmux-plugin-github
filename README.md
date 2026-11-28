@@ -35,13 +35,42 @@ Key properties:
 
 ### Installation
 
+#### Option 1: Install via Botmux / npm Registry (Recommended)
+
 ```bash
 botmux plugin install github
 # or by full npm package name:
 botmux plugin install @botmux-ai/plugin-github
 ```
 
-Open the Botmux Dashboard and navigate to **`#/plugins/github`** to configure authentication, optional webhook/proxy settings, and repository watch rules.
+#### Option 2: Install via GitHub Release (`.tgz` + `.tgz.sha512`)
+
+Every `v*` tag published from `main` automatically attaches both the self-contained tarball (`botmux-ai-plugin-github-<version>.tgz`, containing `package/package.json` and `package/dist/`) and its single-line SRI integrity checksum (`botmux-ai-plugin-github-<version>.tgz.sha512`, format `sha512-<base64>`) to [GitHub Releases](https://github.com/botmux-ai/botmux-plugin-github/releases):
+
+```bash
+VERSION=0.1.0
+BASE_URL="https://github.com/botmux-ai/botmux-plugin-github/releases/download/v${VERSION}"
+curl -fsSLO "${BASE_URL}/botmux-ai-plugin-github-${VERSION}.tgz"
+curl -fsSLO "${BASE_URL}/botmux-ai-plugin-github-${VERSION}.tgz.sha512"
+
+# Verify SRI SHA-512 integrity before installing
+EXPECTED="$(tr -d '\r\n' < "botmux-ai-plugin-github-${VERSION}.tgz.sha512")"
+ACTUAL="sha512-$(openssl dgst -sha512 -binary "botmux-ai-plugin-github-${VERSION}.tgz" | openssl base64 -A)"
+test "${ACTUAL}" = "${EXPECTED}"
+
+botmux plugin install "./botmux-ai-plugin-github-${VERSION}.tgz"
+```
+
+### Quick Setup in Dashboard (`#/plugins/github`)
+
+Open the Botmux Dashboard and navigate to **`#/plugins/github`**. The configuration page is designed for out-of-the-box setup in 2 steps:
+
+1. **Zero-config GitHub Authentication**: On page load, the plugin automatically probes your local `gh auth token` login in memory (never exposing any raw token to the browser) and defaults to `gh_cli` mode with a one-click **Test Connection** button. Fine-grained/classic PAT, GitHub App, and custom GHES `apiBaseUrl` settings are collapsed under **Switch Authentication Method** (write-only secrets).
+2. **2-Step Repository Watch Rule**: Clicking **Add Repository Rule** applies the **PR Auto Review Group** preset, surfacing only 2 required fields:
+   - **Repository (`owner/repo`)**, e.g. `deepcoldy/botmux`;
+   - **Bot Roles** selected by friendly Bot name from Botmux (`Creator Bot` auto-preselected, `Reviewer Bots` multi-select with automatic first-reviewer `Kickoff Bot` selection).
+   All low-frequency options (base branches, trigger events, author/label allow/denylists, chat mode, templates, working dir, top notice, PR share-link comment, new-commit/PR-closed notices, custom poll interval) start with sensible defaults inside the collapsed **Advanced Filter & Template Settings** section (showing a customized-count badge when editing customized rules).
+3. **Global Advanced Settings & Diagnostics**: Proxy, loopback Webhook, service port, global poll interval, and per-repo hourly group-creation cap are collapsed at the bottom with a single-line summary. Tracked PR-to-group mappings, recent events, and manual PR backfill are available inside the collapsible diagnostics section.
 
 ### Configuration Example (`~/.botmux/plugins/github/config.json`, mode `0600`)
 
@@ -175,11 +204,42 @@ npm test
 
 ### 安装与使用
 
+#### 方式一：通过 Botmux / npm 源安装（推荐）
+
 ```bash
 botmux plugin install github
+# 或指定完整 npm 包名：
+botmux plugin install @botmux-ai/plugin-github
 ```
 
-安装后在 Botmux Dashboard 打开 **`#/plugins/github`** 页面即可完成鉴权配置、仓库规则增删改、鉴权测试、状态与限流监控及历史 PR 手动拉群。所有密钥保存在 `0600` 权限的 `~/.botmux/plugins/github/config.json`，回传浏览器时严格脱敏（只写不回显）。
+#### 方式二：通过 GitHub Release 安装（`.tgz` + `.tgz.sha512`）
+
+仓库每次在 `main` 分支打 `v*` tag 时，会自动通过双通道发布工作流同时产出 [GitHub Release](https://github.com/botmux-ai/botmux-plugin-github/releases) 资产（`botmux-ai-plugin-github-<version>.tgz` 及单行标准 SRI 格式校验文件 `.tgz.sha512`，即 `sha512-<base64>`）与 npm OIDC Trusted Publishing 包：
+
+```bash
+VERSION=0.1.0
+BASE_URL="https://github.com/botmux-ai/botmux-plugin-github/releases/download/v${VERSION}"
+curl -fsSLO "${BASE_URL}/botmux-ai-plugin-github-${VERSION}.tgz"
+curl -fsSLO "${BASE_URL}/botmux-ai-plugin-github-${VERSION}.tgz.sha512"
+
+# 校验 SRI SHA-512 完整性后再安装
+EXPECTED="$(tr -d '\r\n' < "botmux-ai-plugin-github-${VERSION}.tgz.sha512")"
+ACTUAL="sha512-$(openssl dgst -sha512 -binary "botmux-ai-plugin-github-${VERSION}.tgz" | openssl base64 -A)"
+test "${ACTUAL}" = "${EXPECTED}"
+
+botmux plugin install "./botmux-ai-plugin-github-${VERSION}.tgz"
+```
+
+#### Dashboard 极简配置指引（`#/plugins/github`）
+
+安装后打开 Botmux Dashboard 的 **`#/plugins/github`** 页面，开箱即用、2 步即可完成配置：
+
+1. **默认免配鉴权**：打开页面自动探测本机 `gh auth token` 登录态（仅服务端内存读取，绝不向前端暴露任何 token），已登录时绿色状态卡直接提示免配可用并默认选用 `gh_cli` 模式；支持一键「测试连接」。如需 PAT、GitHub App 或自定义 GHES `apiBaseUrl`，可按需展开「切换其他鉴权方式」（所有密钥均以 `0600` 权限保存于 `~/.botmux/plugins/github/config.json`，严格只写不回显）。
+2. **2 步添加监控仓库**：点击「+ 添加监控仓库」默认应用「**PR 自动拉群评审**」预设，主界面仅需填 2 项：
+   - **仓库名**（`owner/repo`，如 `deepcoldy/botmux`）；
+   - **Bot 角色选择**（直接展示 Bot 名称：建群 Bot 自动预选首个可用 Bot，评审 Bot 支持多选并自动将首个评审 Bot 设为首审触发 Bot，可下拉改选）。
+   其余分支/作者/标签过滤、会话模式、群名与提示词模板、工作目录、置顶公告、PR 留加群链接、新提交/关闭通知及自定义轮询间隔均提供合理默认值并折叠在「高级过滤与模板设置」中（编辑含自定义项的规则时会显示「已自定义 N 项」徽标）。
+3. **高级设置与运行诊断**：代理、Webhook、服务端口、全局轮询间隔与每小时拉群上限折叠在底部（未展开时一行摘要展示当前值）；已拉群记录、最近事件日志与历史 PR 手动补建收纳在底部诊断折叠区。
 
 ### 常用 CLI 命令
 
