@@ -853,13 +853,16 @@ describe('PR #1 Round-2 Independent Review Regressions (5x P1, 7x P2, 1x P3)', (
     (prInputs[0]!.props.onChange as (e: { target: { value: string } }) => void)({ target: { value: 'owner/repo#12junk' } });
 
     const tree2 = renderOnce();
-    const openBtns = findElements(tree2, el => el.type === 'button' && el.children.includes('Open Review Group'));
+    const openBtns = findElements(
+      tree2,
+      el => el.type === 'button' && el.props['data-action'] === 'open-pr',
+    );
     assert.equal(openBtns.length, 1);
     await (openBtns[0]!.props.onClick as () => Promise<void>)();
 
     assert.equal(openPrCalled, false, 'Dashboard MUST reject owner/repo#12junk without invoking /api/open-pr');
     const tree3 = renderOnce();
-    const hasErrText = JSON.stringify(tree3).includes('PR number must be a positive integer');
+    const hasErrText = JSON.stringify(tree3).includes('PR 编号必须是正整数');
     assert.equal(hasErrText, true);
   });
 
